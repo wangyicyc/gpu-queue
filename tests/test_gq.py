@@ -34,6 +34,27 @@ PMON_MY_PID = """\
     0      {pid}     C    60    30     0     0   python3
 """
 
+# Realistic desktop environment: graphics processes (type=G) owned by the user,
+# NO compute process. This is the always-present desktop compositor (Xorg,
+# gnome-shell, chrome, VS Code). The GPU is idle for queue purposes.
+PMON_DESKTOP_ONLY = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %   name
+    0       1255     G      -      -      -      -   Xorg
+    0       2054     G     10      4      -      -   gnome-shell
+    0       3955     G      -      -      -      -   chrome
+    0    1949928     G      -      -      -      -   Code
+"""
+
+# Desktop environment + my compute job (type=C) → GPU is busy.
+PMON_DESKTOP_PLUS_COMPUTE = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %   name
+    0       1255     G      -      -      -      -   Xorg
+    0       2054     G     10      4      -      -   gnome-shell
+    0    {pid}     C     60     30      -      -   python
+"""
+
 
 def make_pmon_result(stdout, returncode=0):
     r = MagicMock()
@@ -57,12 +78,41 @@ def test_gpu_idle_other_user_process():
 
 
 def test_gpu_busy_my_process():
-    """A process owned by the current user should block."""
+    """A compute process owned by the current user should block."""
     my_pid = os.getpid()
     pmon_out = PMON_MY_PID.format(pid=my_pid)
     with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = os.getuid()
+        assert gq.gpu_is_idle() is False
+
+
+def test_gpu_idle_desktop_graphics_processes():
+    """Graphics (type=G) processes owned by me must NOT block the queue.
+
+    Regression test: the desktop environment (Xorg, gnome-shell, chrome, VS Code)
+    is always on the GPU and owned by the user. Before the fix, gpu_is_idle()
+    treated these as "GPU busy" and the queue never advanced.
+    """
+    with patch("subprocess.run", return_value=make_pmon_result(PMON_DESKTOP_ONLY)), \
+         patch("os.stat") as mock_stat:
+        mock_stat.return_value.st_uid = os.getuid()  # all desktop procs are mine
+        assert gq.gpu_is_idle() is True
+
+
+def test_gpu_busy_desktop_plus_my_compute():
+    """Desktop graphics + my compute (type=C) process → busy."""
+    my_pid = os.getpid()
+    pmon_out = PMON_DESKTOP_PLUS_COMPUTE.format(pid=my_pid)
+
+    def fake_stat(path):
+        # The compute pid is mine; graphics pids are also mine but type=G (skipped).
+        s = MagicMock()
+        s.st_uid = os.getuid()
+        return s
+
+    with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
+         patch("os.stat", side_effect=fake_stat):
         assert gq.gpu_is_idle() is False
 
 

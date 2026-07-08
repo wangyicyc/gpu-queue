@@ -21,7 +21,13 @@ STATE_FILE = QUEUE_DIR / "state.json"
 
 
 def gpu_is_idle() -> bool:
-    """Return True if no process owned by the current user is using the GPU."""
+    """Return True if no compute (type=C) process owned by the current user is on the GPU.
+
+    Only Compute-context processes (CUDA workloads, e.g. python training jobs) count
+    as "GPU busy". Graphics processes (type=G: Xorg, gnome-shell, chrome, VS Code, ...)
+    are the desktop environment and are always present — they must NOT block the queue,
+    or the GPU would never be reported idle.
+    """
     uid = os.getuid()
     try:
         result = subprocess.run(
@@ -46,7 +52,10 @@ def gpu_is_idle() -> bool:
         if line.startswith("#") or not line.strip():
             continue
         parts = line.split()
-        if len(parts) < 2:
+        # pmon columns: gpu  pid  type  ...  command  (type at index 2)
+        if len(parts) < 3:
+            continue
+        if parts[2] != "C":          # skip Graphics (G) — desktop environment
             continue
         try:
             pid = int(parts[1])
