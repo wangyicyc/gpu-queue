@@ -20,7 +20,7 @@
 
 ```bash
 # 一行装好（把 gq 放到 ~/.local/bin）
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/gpu-queue/main/gq -o ~/.local/bin/gq
+curl -fsSL https://raw.githubusercontent.com/wangyicyc/gpu-queue/main/gq -o ~/.local/bin/gq
 chmod +x ~/.local/bin/gq
 
 # 确保 ~/.local/bin 在 PATH 里（加到 ~/.bashrc）
@@ -87,7 +87,7 @@ GPU 一空闲，daemon 自动把队列里的任务挂上去跑，一个接一个
 ### 测试
 
 ```bash
-git clone https://github.com/<你的用户名>/gpu-queue.git
+git clone https://github.com/wangyicyc/gpu-queue.git
 cd gpu-queue
 python -m pytest tests/ -v
 ```
@@ -121,7 +121,7 @@ A lightweight local GPU job queue: throw shell commands into a queue, and `gq` w
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/gpu-queue/main/gq -o ~/.local/bin/gq
+curl -fsSL https://raw.githubusercontent.com/wangyicyc/gpu-queue/main/gq -o ~/.local/bin/gq
 chmod +x ~/.local/bin/gq
 
 # Ensure ~/.local/bin is on PATH
