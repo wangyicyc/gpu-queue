@@ -158,6 +158,11 @@ def _make_job(cmd: str, cwd: str) -> dict:
         "cmd": cmd,
         "cwd": cwd,
         "added_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        # Snapshot the caller's environment so the daemon can re-create it at
+        # execution time. Popen(env=...) is a full replacement, not a merge, so
+        # the entire dict must be stored (conda/venv activation rewrites PATH and
+        # sets many CONDA_* / VIRTUAL_ENV vars that a cherry-pick would drop).
+        "env": dict(os.environ),
     }
 
 

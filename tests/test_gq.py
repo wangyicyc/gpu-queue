@@ -156,9 +156,22 @@ def test_write_then_read_queue():
 
 def test_make_job_fields():
     job = gq._make_job("python train.py", "/home/user/project")
-    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at"}
+    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env"}
     assert job["cmd"] == "python train.py"
     assert job["cwd"] == "/home/user/project"
+    assert isinstance(job["env"], dict)
+
+
+def test_make_job_captures_env(monkeypatch):
+    """_make_job snapshots os.environ into the env field."""
+    monkeypatch.setenv("GQ_TEST_ENV_VAR", "captured-value")
+    job = gq._make_job("echo hi", "/tmp")
+    assert job["env"]["GQ_TEST_ENV_VAR"] == "captured-value"
+    # Full snapshot, not a cherry-pick
+    assert job["env"] == dict(os.environ)
+    # It's a copy — mutating the snapshot must not touch os.environ
+    job["env"]["ANOTHER"] = "x"
+    assert "ANOTHER" not in os.environ
 
 
 def test_read_state_empty():
