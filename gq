@@ -272,7 +272,8 @@ def _run_job(job: dict) -> int:
     print(f"[gq] >>> {job['cmd']}")
     try:
         proc = subprocess.Popen(job["cmd"], shell=True, cwd=cwd,
-                                start_new_session=True)
+                                start_new_session=True,
+                                env=job.get("env"))
     except Exception as exc:
         print(f"[gq] ERROR running job {job['id']}: {exc}")
         return -1

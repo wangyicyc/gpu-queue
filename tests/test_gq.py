@@ -574,3 +574,46 @@ def test_cmd_watch_finally_clears_daemon_pid(tmp_path, monkeypatch):
             pass
     assert gq.read_state()["daemon_pid"] is None
 
+
+def test_run_job_passes_env_to_popen(monkeypatch):
+    """_run_job passes the job's captured env to Popen (full replacement)."""
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc(pid=4242)
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job_env = {"PATH": "/fake/bin", "CONDA_DEFAULT_ENV": "myenv", "MY_VAR": "v"}
+    job = {"id": "t1", "cmd": "echo hi", "cwd": "/tmp",
+           "started_at": datetime.datetime.now().isoformat(), "env": job_env}
+    gq._run_job(job)
+    assert captured["kwargs"]["env"] == job_env
+
+
+def test_run_job_legacy_no_env(monkeypatch):
+    """A job without an env field → Popen called with env=None (inherit daemon env)."""
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc(pid=1111)
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job = {"id": "t2", "cmd": "echo hi", "cwd": "/tmp",
+           "started_at": datetime.datetime.now().isoformat()}  # no env key
+    gq._run_job(job)
+    assert captured["kwargs"]["env"] is None
+
