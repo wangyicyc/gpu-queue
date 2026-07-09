@@ -673,3 +673,24 @@ def test_cmd_list_no_env_suffix_when_no_env(tmp_path, monkeypatch, capsys):
     # so we scope the check to the command + suffix boundary.)
     assert "python train.py  [" not in out
 
+
+def test_cmd_list_shows_env_name_running(tmp_path, monkeypatch, capsys):
+    """The running-job row also shows the captured env name suffix."""
+    monkeypatch.chdir(tmp_path)
+    gq.write_state({
+        "daemon_pid": None,
+        "running": {
+            "id": "r1",
+            "cmd": "python train.py",
+            "cwd": str(tmp_path),
+            "started_at": "2026-07-09T10:00:00",
+            "env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"},
+        },
+    })
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "[myenv]" in out
+    # The suffix should appear on the running row (not just a pending row,
+    # since no pending jobs exist here).
+    assert "python train.py" in out
+
