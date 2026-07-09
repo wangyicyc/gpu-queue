@@ -617,3 +617,59 @@ def test_run_job_legacy_no_env(monkeypatch):
     gq._run_job(job)
     assert captured["kwargs"]["env"] is None
 
+
+def test_env_name_conda():
+    job = {"env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"}}
+    assert gq._env_name(job) == "myenv"
+
+
+def test_env_name_venv():
+    job = {"env": {"VIRTUAL_ENV": "/home/u/.venvs/ml", "PATH": "/x"}}
+    assert gq._env_name(job) == "ml"
+
+
+def test_env_name_none():
+    assert gq._env_name({}) == ""
+    assert gq._env_name({"env": {"PATH": "/x"}}) == ""
+    # CONDA_DEFAULT_ENV takes precedence over VIRTUAL_ENV
+    job = {"env": {"CONDA_DEFAULT_ENV": "conda", "VIRTUAL_ENV": "/v"}}
+    assert gq._env_name(job) == "conda"
+
+
+def test_cmd_list_shows_env_name(tmp_path, monkeypatch, capsys):
+    """Pending rows show [envname] suffix when the job captured a conda env."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "myenv")
+    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "python train.py" in out
+    assert "[myenv]" in out
+
+
+def test_cmd_list_shows_venv_name(tmp_path, monkeypatch, capsys):
+    """Pending rows show [basename] for a venv job."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", "/home/u/.venvs/ml")
+    # Ensure no conda var is set so venv path wins
+    monkeypatch.delenv("CONDA_DEFAULT_ENV", raising=False)
+    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "[ml]" in out
+
+
+def test_cmd_list_no_env_suffix_when_no_env(tmp_path, monkeypatch, capsys):
+    """A legacy job (no env) shows no suffix."""
+    monkeypatch.chdir(tmp_path)
+    # Build a legacy job directly, bypassing _make_job's env capture
+    gq.write_queue([{"id": "ab12", "cmd": "python train.py", "cwd": str(tmp_path),
+                     "added_at": "2026-07-08T00:00:00"}])
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "python train.py" in out
+    # No [envname] suffix on the job row: the command must not be followed
+    # by the "  [ename]" suffix marker. ([gq] log prefixes still contain "[",
+    # so we scope the check to the command + suffix boundary.)
+    assert "python train.py  [" not in out
+

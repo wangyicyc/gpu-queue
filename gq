@@ -173,6 +173,23 @@ def cmd_add(args) -> None:
     print(f"[gq] added job {job['id']}: {args.command}")
 
 
+def _env_name(job: dict) -> str:
+    """Return a short human-readable name for the job's captured environment.
+
+    Prefers CONDA_DEFAULT_ENV (set by conda activate), else the basename of
+    VIRTUAL_ENV (set by venv/activate). Returns "" if neither is present.
+    Reads from the job's captured env snapshot, NOT os.environ — the daemon
+    runs in a different environment than the shell that added the job.
+    """
+    env = job.get("env") or {}
+    if env.get("CONDA_DEFAULT_ENV"):
+        return env["CONDA_DEFAULT_ENV"]
+    venv = env.get("VIRTUAL_ENV")
+    if venv:
+        return os.path.basename(venv)
+    return ""
+
+
 def cmd_list(args) -> None:
     state = read_state()
     queue = read_queue()
@@ -187,7 +204,9 @@ def cmd_list(args) -> None:
         except (KeyError, ValueError, TypeError):
             elapsed_str = "unknown"
         print("[gq] running:")
-        print(f"  {r['id']}  {r['cmd']}   started {elapsed_str} ago")
+        ename = _env_name(r)
+        suffix = f"  [{ename}]" if ename else ""
+        print(f"  {r['id']}  {r['cmd']}   started {elapsed_str} ago{suffix}")
     else:
         print("[gq] running: none")
 
@@ -198,7 +217,9 @@ def cmd_list(args) -> None:
     if not queue:
         print("  (empty)")
     for i, job in enumerate(queue, 1):
-        print(f"  #{i}  {job['id']}  {job['cmd']}")
+        ename = _env_name(job)
+        suffix = f"  [{ename}]" if ename else ""
+        print(f"  #{i}  {job['id']}  {job['cmd']}{suffix}")
 
     # Daemon status
     dpid = state.get("daemon_pid")
