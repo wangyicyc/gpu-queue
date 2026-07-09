@@ -102,5 +102,9 @@ assert_equals_sorted "gq cancel <Tab> no queue → empty" "" "$out"
 # Cleanup temp HOMEs (the EXIT trap still removes TMPD from Scenario 2).
 rm -rf "$FAKEHOME" "$EMPTYHOME"
 
+# ---- Scenario 6: default branch returns empty (e.g. gq watch <Tab>) ----
+out="$(drive 2 gq watch "")"
+assert_equals_sorted "gq watch <Tab> → empty (default branch)" "" "$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
