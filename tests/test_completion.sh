@@ -76,5 +76,31 @@ assert_contains "gq add train<Tab> completes train_other.py" "train_other.py" "$
 out="$(cd "$TMPD" && drive 2 gq add "")"
 assert_contains "gq add <Tab> lists cwd files" "model.pth" "$out"
 
+# ---- Scenario 3: gq cancel <Tab> lists all pending IDs ----
+# Use an isolated fake ~/.gpu-queue under a temp HOME so we never touch the
+# real one, and the test is hermetic.
+FAKEHOME="$(mktemp -d)"
+mkdir -p "$FAKEHOME/.gpu-queue"
+printf '%s' '[{"id":"3f1a","cmd":"a"},{"id":"a9c2","cmd":"b"}]' \
+    > "$FAKEHOME/.gpu-queue/queue.json"
+
+out="$(HOME="$FAKEHOME" drive 2 gq cancel "")"
+assert_equals_sorted "gq cancel <Tab> lists all IDs" \
+    "3f1a
+a9c2" \
+    "$out"
+
+# ---- Scenario 4: gq cancel 3f<Tab> filters to matching prefix ----
+out="$(HOME="$FAKEHOME" drive 2 gq cancel 3f)"
+assert_equals_sorted "gq cancel 3f<Tab> filters prefix" "3f1a" "$out"
+
+# ---- Scenario 5: gq cancel <Tab> with no queue.json → empty, no error ----
+EMPTYHOME="$(mktemp -d)"
+out="$(HOME="$EMPTYHOME" drive 2 gq cancel "")"
+assert_equals_sorted "gq cancel <Tab> no queue → empty" "" "$out"
+
+# Cleanup temp HOMEs (the EXIT trap still removes TMPD from Scenario 2).
+rm -rf "$FAKEHOME" "$EMPTYHOME"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -24,7 +24,23 @@ _gq() {
         return 0
     fi
 
-    # gq cancel <prefix><Tab> → completed in Task 2.
+    # gq cancel <prefix><Tab> → complete pending job IDs from queue.json.
+    if [ "$subcmd" = "cancel" ] && [ "$COMP_CWORD" -ge 2 ]; then
+        local ids
+        ids="$(python3 -c "
+import json, os
+p = os.path.join(os.environ.get('HOME', ''), '.gpu-queue', 'queue.json')
+try:
+    with open(p) as f:
+        q = json.load(f)
+    print('\n'.join(j['id'] for j in q if isinstance(j, dict) and 'id' in j))
+except (OSError, ValueError, KeyError):
+    pass
+" 2>/dev/null)"
+        COMPREPLY=($(compgen -W "$ids" -- "$cur"))
+        return 0
+    fi
+
     # gq watch --poll <n> → no completion (number).
     # Default: no completion.
     COMPREPLY=()
