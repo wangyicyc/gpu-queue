@@ -14,6 +14,7 @@
 - **空闲检测按"你的进程"判断**：不是看 GPU 利用率数字，而是看 `nvidia-smi` 里有没有**当前用户**的进程在占 GPU。你的进程结束 = 空闲 = 拖下一个任务，比显存阈值更准
 - **一次只跑一个**：同步执行，stdout/stderr 直接打到 daemon 终端
 - **安全**：fcntl 文件锁防并发写坏；Ctrl-C 一次优雅停、连按两次强制杀当前任务；daemon 崩溃重启能识别并清理孤儿进程
+- **自动带上你的环境**：`gq add` 时会快照当前 `conda`/`venv` 环境,daemon 执行时原样还原。`conda activate myenv` 后再 `gq add 'python train.py'`,任务就在 `myenv` 里跑
 - **任意 shell 命令**：`python train.py`、`bash run.sh` 都能排队
 
 ### 安装
@@ -116,6 +117,7 @@ A lightweight local GPU job queue: throw shell commands into a queue, and `gq` w
 - **Idle = "your process is gone"** — instead of GPU utilization thresholds, it checks `nvidia-smi` for any process owned by the **current user**. Your process ends → idle → next job runs. More accurate than memory thresholds.
 - **One job at a time** — synchronous execution, stdout/stderr stream straight to the daemon's terminal
 - **Safe** — `fcntl` file locks prevent corruption; Ctrl-C once = graceful, twice = force-kill; crash recovery detects and reaps orphaned subprocesses
+- **Carries your environment** — `gq add` snapshots the current `conda`/`venv` env and the daemon restores it at execution time. `conda activate myenv` then `gq add 'python train.py'` runs the job inside `myenv`
 - **Any shell command** — `python train.py`, `bash run.sh`, anything
 
 ### Install

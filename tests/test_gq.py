@@ -156,9 +156,22 @@ def test_write_then_read_queue():
 
 def test_make_job_fields():
     job = gq._make_job("python train.py", "/home/user/project")
-    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at"}
+    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env"}
     assert job["cmd"] == "python train.py"
     assert job["cwd"] == "/home/user/project"
+    assert isinstance(job["env"], dict)
+
+
+def test_make_job_captures_env(monkeypatch):
+    """_make_job snapshots os.environ into the env field."""
+    monkeypatch.setenv("GQ_TEST_ENV_VAR", "captured-value")
+    job = gq._make_job("echo hi", "/tmp")
+    assert job["env"]["GQ_TEST_ENV_VAR"] == "captured-value"
+    # Full snapshot, not a cherry-pick
+    assert job["env"] == dict(os.environ)
+    # It's a copy — mutating the snapshot must not touch os.environ
+    job["env"]["ANOTHER"] = "x"
+    assert "ANOTHER" not in os.environ
 
 
 def test_read_state_empty():
@@ -560,4 +573,124 @@ def test_cmd_watch_finally_clears_daemon_pid(tmp_path, monkeypatch):
         except KeyboardInterrupt:
             pass
     assert gq.read_state()["daemon_pid"] is None
+
+
+def test_run_job_passes_env_to_popen(monkeypatch):
+    """_run_job passes the job's captured env to Popen (full replacement)."""
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc(pid=4242)
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job_env = {"PATH": "/fake/bin", "CONDA_DEFAULT_ENV": "myenv", "MY_VAR": "v"}
+    job = {"id": "t1", "cmd": "echo hi", "cwd": "/tmp",
+           "started_at": datetime.datetime.now().isoformat(), "env": job_env}
+    gq._run_job(job)
+    assert captured["kwargs"]["env"] == job_env
+
+
+def test_run_job_legacy_no_env(monkeypatch):
+    """A job without an env field → Popen called with env=None (inherit daemon env)."""
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+        def wait(self):
+            return 0
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeProc(pid=1111)
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job = {"id": "t2", "cmd": "echo hi", "cwd": "/tmp",
+           "started_at": datetime.datetime.now().isoformat()}  # no env key
+    gq._run_job(job)
+    assert captured["kwargs"]["env"] is None
+
+
+def test_env_name_conda():
+    job = {"env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"}}
+    assert gq._env_name(job) == "myenv"
+
+
+def test_env_name_venv():
+    job = {"env": {"VIRTUAL_ENV": "/home/u/.venvs/ml", "PATH": "/x"}}
+    assert gq._env_name(job) == "ml"
+
+
+def test_env_name_none():
+    assert gq._env_name({}) == ""
+    assert gq._env_name({"env": {"PATH": "/x"}}) == ""
+    # CONDA_DEFAULT_ENV takes precedence over VIRTUAL_ENV
+    job = {"env": {"CONDA_DEFAULT_ENV": "conda", "VIRTUAL_ENV": "/v"}}
+    assert gq._env_name(job) == "conda"
+
+
+def test_cmd_list_shows_env_name(tmp_path, monkeypatch, capsys):
+    """Pending rows show [envname] suffix when the job captured a conda env."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "myenv")
+    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "python train.py" in out
+    assert "[myenv]" in out
+
+
+def test_cmd_list_shows_venv_name(tmp_path, monkeypatch, capsys):
+    """Pending rows show [basename] for a venv job."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VIRTUAL_ENV", "/home/u/.venvs/ml")
+    # Ensure no conda var is set so venv path wins
+    monkeypatch.delenv("CONDA_DEFAULT_ENV", raising=False)
+    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "[ml]" in out
+
+
+def test_cmd_list_no_env_suffix_when_no_env(tmp_path, monkeypatch, capsys):
+    """A legacy job (no env) shows no suffix."""
+    monkeypatch.chdir(tmp_path)
+    # Build a legacy job directly, bypassing _make_job's env capture
+    gq.write_queue([{"id": "ab12", "cmd": "python train.py", "cwd": str(tmp_path),
+                     "added_at": "2026-07-08T00:00:00"}])
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "python train.py" in out
+    # No [envname] suffix on the job row: the command must not be followed
+    # by the "  [ename]" suffix marker. ([gq] log prefixes still contain "[",
+    # so we scope the check to the command + suffix boundary.)
+    assert "python train.py  [" not in out
+
+
+def test_cmd_list_shows_env_name_running(tmp_path, monkeypatch, capsys):
+    """The running-job row also shows the captured env name suffix."""
+    monkeypatch.chdir(tmp_path)
+    gq.write_state({
+        "daemon_pid": None,
+        "running": {
+            "id": "r1",
+            "cmd": "python train.py",
+            "cwd": str(tmp_path),
+            "started_at": "2026-07-09T10:00:00",
+            "env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"},
+        },
+    })
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "[myenv]" in out
+    # The suffix should appear on the running row (not just a pending row,
+    # since no pending jobs exist here).
+    assert "python train.py" in out
 
