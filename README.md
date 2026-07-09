@@ -36,32 +36,116 @@ gq --help
 
 ### 用法
 
-在 tmux 里开两个窗口（daemon 要常驻，tmux 保证关终端不死）：
+`gq` 是 daemon 模型：你在 tmux 里常驻一个 `gq watch` 守护进程，它盯着 GPU；你从别的窗口用 `gq add` 把命令丢进队列。GPU 一空闲，daemon 自动拖下一个任务跑，一个接一个，直到队列清空。
+
+#### 快速开始
 
 ```bash
-# 窗口 A：常驻 daemon（任务输出打到这里）
-gq watch --poll 15        # 每 15 秒检查一次 GPU
+# 1) 开 tmux，起常驻 daemon（所有任务输出都打到这里）
+tmux new -s gq
+gq watch --poll 15
 
-# 窗口 B：加任务、看状态
+# 2) 另开一个 tmux 窗口（Ctrl-B c），加任务
 gq add 'python train.py --seed 1'
 gq add 'python train.py --seed 2'
-gq add 'python train.py --seed 3'
-gq list                   # 看队列 + 当前运行状态
-gq cancel <id>            # 取消某个排队中的任务（支持 ID 前缀）
-gq clear                  # 清空队列（不影响正在跑的）
+
+# 3) 看状态
+gq list
 ```
 
-GPU 一空闲，daemon 自动把队列里的任务挂上去跑，一个接一个。
+`gq list` 大致长这样：
 
-### 命令一览
+```
+[gq] running:
+  3f1a  python train.py --seed 1   started 0:04:12 ago  [myenv]
+
+[gq] queue (1 job):
+  #1  a9c2  python train.py --seed 2  [myenv]
+
+[gq] daemon: running (pid 12345)
+```
+
+三段分别是：**正在跑的任务**（含已运行时长 + 环境名）、**待跑队列**（按顺序编号）、**daemon 状态**（running / stale pid / not running）。
+
+#### 一个任务的生命周期
+
+1. **`gq add`** —— 命令进入 `queue.json` 待跑队列。同时**快照**你当前的 shell 环境（conda/venv、PATH 等）和工作目录。
+2. **等待** —— daemon 每 `--poll` 秒检查一次 GPU 是否空闲。
+3. **执行** —— 空闲后，daemon 从队首弹出任务，用快照的环境还原后跑（`Popen(env=...)`）。stdout/stderr 直接打到 daemon 终端。
+4. **完成** —— 任务结束（exit 0 = DONE，非 0 = FAILED），daemon 清掉运行状态，继续拖下一个。
+5. **队列空** —— daemon 继续轮询，等你 `gq add` 新任务。
+
+### 带上你的 conda / venv 环境
+
+这是 `gq` 的关键能力：你 `add` 时激活了什么环境，任务就在什么环境里跑——而不是 daemon 自己的环境。
+
+```bash
+# 激活你想用的环境
+conda activate myenv          # 或 source ~/.venvs/ml/bin/activate
+
+# 然后 add，gq 会自动记住这个环境
+gq add 'python train.py --seed 1'    # → 会在 myenv 里跑
+```
+
+每个任务**各自**记住自己 `add` 时的环境，所以可以混排不同环境的任务：
+
+```bash
+conda activate torch200 && gq add 'python train.py --seed 1'
+conda activate torch210 && gq add 'python train.py --seed 2'
+# 两个任务会分别在 torch200 / torch210 里跑
+```
+
+`gq list` 会在每个任务后显示环境名（优先 `CONDA_DEFAULT_ENV`，否则 venv 目录名）：
+
+```
+  #1  3f1a  python train.py --seed 1  [torch200]
+  #2  a9c2  python train.py --seed 2  [torch210]
+```
+
+> 环境是 `add` 时刻的**快照**。之后 conda 环境路径变了不会自动更新——符合"用我 add 时的环境跑"的语义。
+> 环境快照（可能含 API key 等）会存到 `~/.gpu-queue/` 下，仅本机本用户可读。
+
+### 命令详解
 
 | 命令 | 作用 |
 |------|------|
 | `gq watch [--poll N]` | 启动 daemon（默认 15 秒轮询；在 tmux 里跑） |
-| `gq add 'cmd'` | 追加任务到队尾（用当前目录作为工作目录） |
+| `gq add 'cmd'` | 追加任务到队尾（用当前目录作 cwd，快照当前环境） |
 | `gq list` | 查看运行中的任务 + 待跑队列 + daemon 状态 |
 | `gq cancel <id>` | 按 ID 或唯一前缀移除排队中的任务 |
-| `gq clear` | 清空所有待跑任务 |
+| `gq clear` | 清空所有待跑任务（不影响正在跑的） |
+
+**`gq watch [--poll N]`**　启动守护进程。若已有 daemon 在跑会拒绝启动。启动时做崩溃恢复：发现上次崩溃留下的孤儿任务进程会杀掉它的进程组再清状态。`--poll` 控制检查 GPU 的间隔（秒），默认 15。
+
+**`gq add '<command>'`**　把任意 shell 命令追加到队尾。命令用**当前目录**作为工作目录，并**快照当前环境**。例：`gq add 'bash run.sh'`、`gq add 'python -m foo.bar --x 1'`。
+
+**`gq list`**　三段输出：运行中的任务（含已运行时长 + 环境名）、待跑队列（按顺序编号）、daemon 状态（running / stale pid / not running）。
+
+**`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务不能 cancel——去 daemon 终端按 Ctrl-C。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
+
+**`gq clear`**　清空所有待跑任务，正在跑的不受影响。
+
+### 常见场景
+
+**跑一组超参 sweep：**
+
+```bash
+for seed in 1 2 3 4 5; do
+  gq add "python train.py --seed $seed"
+done
+gq list    # 确认 5 个都在队列里
+```
+
+**取消排错的任务：**
+
+```bash
+gq list              # 看到 #2 是 a9c2，想取消它
+gq cancel a9c2       # 或用前缀：gq cancel a9
+```
+
+**daemon 崩溃 / 重启电脑后：** 重新 `gq watch` 即可。它会自动清理上次没跑完的孤儿进程，继续处理队列里剩下的任务。
+
+**临时切到别的环境加任务：** 直接 `conda activate 别的env` 再 `gq add`，新任务带新环境；已经在队列里的旧任务不受影响。
 
 ### 空闲检测原理
 
@@ -135,26 +219,116 @@ gq --help
 
 ### Usage
 
-Run the daemon in tmux (so it survives terminal close), add jobs from another pane:
+`gq` is a daemon model: you keep a `gq watch` daemon running in tmux, and it watches the GPU; from another pane you `gq add` commands to the queue. The moment the GPU is idle, the daemon launches the next job, one after another, until the queue drains.
+
+#### Quick start
 
 ```bash
-gq watch --poll 15          # pane A: daemon, prints job output here
-gq add 'python train.py --seed 1'   # pane B
+# 1) Open tmux, start the daemon (all job output lands here)
+tmux new -s gq
+gq watch --poll 15
+
+# 2) Open another tmux pane (Ctrl-B c), add jobs
+gq add 'python train.py --seed 1'
 gq add 'python train.py --seed 2'
+
+# 3) Check status
 gq list
-gq cancel <id>
-gq clear
 ```
+
+`gq list` looks roughly like this:
+
+```
+[gq] running:
+  3f1a  python train.py --seed 1   started 0:04:12 ago  [myenv]
+
+[gq] queue (1 job):
+  #1  a9c2  python train.py --seed 2  [myenv]
+
+[gq] daemon: running (pid 12345)
+```
+
+The three blocks are: the **running job** (with elapsed time + env name), the **pending queue** (numbered in order), and the **daemon status** (running / stale pid / not running).
+
+#### A job's lifecycle
+
+1. **`gq add`** — the command enters the pending queue in `queue.json`. It also **snapshots** your current shell environment (conda/venv, PATH, …) and working directory.
+2. **Wait** — the daemon checks whether the GPU is idle every `--poll` seconds.
+3. **Run** — once idle, the daemon pops the head job and runs it with the snapshot's environment restored (`Popen(env=...)`). stdout/stderr stream straight to the daemon's terminal.
+4. **Finish** — when the job exits (0 = DONE, non-zero = FAILED), the daemon clears the running state and moves to the next job.
+5. **Empty queue** — the daemon keeps polling, waiting for you to `gq add` more.
+
+### Carry your conda / venv environment
+
+This is `gq`'s key capability: the environment you had active when you `add` is the environment the job runs in — not the daemon's own environment.
+
+```bash
+# Activate the env you want
+conda activate myenv          # or: source ~/.venvs/ml/bin/activate
+
+# Then add — gq remembers this env automatically
+gq add 'python train.py --seed 1'    # → runs inside myenv
+```
+
+Each job remembers **its own** environment from `add` time, so you can interleave jobs across different envs:
+
+```bash
+conda activate torch200 && gq add 'python train.py --seed 1'
+conda activate torch210 && gq add 'python train.py --seed 2'
+# the two jobs run inside torch200 / torch210 respectively
+```
+
+`gq list` shows the env name after each job (prefers `CONDA_DEFAULT_ENV`, else the venv dir name):
+
+```
+  #1  3f1a  python train.py --seed 1  [torch200]
+  #2  a9c2  python train.py --seed 2  [torch210]
+```
+
+> The environment is a **snapshot** taken at `add` time. If the conda env's install path changes later, the job does not auto-update — this matches the "run in the env I had when I added it" semantics.
+> The env snapshot (which may contain API keys) is stored under `~/.gpu-queue/`, readable only by you on this machine.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `gq watch [--poll N]` | Start the daemon (default poll 15s; run in tmux) |
-| `gq add 'cmd'` | Append a job (uses current dir as cwd) |
+| `gq add 'cmd'` | Append a job (uses current dir as cwd, snapshots current env) |
 | `gq list` | Show running job + pending queue + daemon status |
 | `gq cancel <id>` | Remove a pending job by ID or unique prefix |
-| `gq clear` | Clear all pending jobs |
+| `gq clear` | Clear all pending jobs (does not affect a running job) |
+
+**`gq watch [--poll N]`** — Starts the daemon. Refuses to start if a daemon is already running. On startup it performs crash recovery: if a previous crash left an orphaned job process, it kills that process group and clears the state. `--poll` sets the GPU-check interval in seconds (default 15).
+
+**`gq add '<command>'`** — Appends any shell command to the queue tail. The command runs with the **current directory** as its working directory and a **snapshot of the current environment**. e.g. `gq add 'bash run.sh'`, `gq add 'python -m foo.bar --x 1'`.
+
+**`gq list`** — Three blocks: the running job (with elapsed time + env name), the pending queue (numbered in order), and the daemon status (running / stale pid / not running).
+
+**`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled this way — Ctrl-C the daemon instead. If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
+
+**`gq clear`** — Clears all pending jobs; a running job is unaffected.
+
+### Common scenarios
+
+**Run a hyperparameter sweep:**
+
+```bash
+for seed in 1 2 3 4 5; do
+  gq add "python train.py --seed $seed"
+done
+gq list    # confirm all 5 are queued
+```
+
+**Cancel a mis-queued job:**
+
+```bash
+gq list             # see #2 is a9c2, want to drop it
+gq cancel a9c2      # or by prefix: gq cancel a9
+```
+
+**After a daemon crash / reboot:** just run `gq watch` again. It reaps any orphaned process from the previous run and resumes the remaining queue.
+
+**Switch envs for a new job:** just `conda activate otherenv` and `gq add`; the new job carries the new env, while jobs already in the queue are unaffected.
 
 ### Idle detection
 
