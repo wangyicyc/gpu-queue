@@ -169,6 +169,21 @@ gq cancel a9c2       # 或用前缀：gq cancel a9
 
 两个文件都受 `fcntl.flock` 保护，CLI 和 daemon 同时读写不会写坏。文件损坏会自动重置并告警，不会崩溃。
 
+### Shell 补全（可选）
+
+`gq` 带 bash 补全：`gq <Tab>` 补全子命令，`gq add train<Tab>` 补全文件名，`gq cancel <Tab>` 补全队列里的任务 ID。
+
+```bash
+# 装到 bash-completion 自动加载目录（无需改 .bashrc）
+mkdir -p ~/.local/share/bash-completion/completions
+cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
+
+# 开个新终端即生效；或当场 source：
+. ~/.local/share/bash-completion/completions/gq
+```
+
+> 需要 bash-completion（大多数发行版默认装了）。补全脚本在仓库的 `completions/gq.bash`，clone 后即可用。
+
 ### 测试
 
 ```bash
@@ -333,6 +348,21 @@ gq cancel a9c2      # or by prefix: gq cancel a9
 ### Idle detection
 
 `nvidia-smi pmon -s um -c 1` lists all GPU-occupying processes; each PID's owner is checked via `/proc/<pid>`. No process owned by you → idle. `nvidia-smi` failure → treated as busy (safe default).
+
+### Shell completion (optional)
+
+`gq` ships a bash completion: `gq <Tab>` completes subcommands, `gq add train<Tab>` completes filenames, `gq cancel <Tab>` completes pending job IDs from the queue.
+
+```bash
+# Install to bash-completion's auto-load dir (no .bashrc edit needed)
+mkdir -p ~/.local/share/bash-completion/completions
+cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
+
+# A new shell picks it up; or source it now:
+. ~/.local/share/bash-completion/completions/gq
+```
+
+> Requires bash-completion (installed by default on most distros). The completion script lives at `completions/gq.bash` in the repo — usable after `git clone`.
 
 ### Tests
 
