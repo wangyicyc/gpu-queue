@@ -12,7 +12,7 @@ _gq() {
 
     # Subcommand position: complete the fixed subcommand list.
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "watch add list cancel clear" -- "$cur"))
+        COMPREPLY=($(compgen -W "watch add list cancel clear stop" -- "$cur"))
         return 0
     fi
 
