@@ -359,9 +359,9 @@ def test_cmd_clear_removes_all(tmp_path, monkeypatch, capsys):
 def test_cmd_stop_no_running_job(capsys):
     """gq stop with no running job → message, no kill attempted."""
     gq.write_state({"daemon_pid": None, "running": {}})
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="zzzz"))
     out = capsys.readouterr().out
-    assert "no job currently running" in out
+    assert "no running job" in out.lower() or "not found" in out.lower()
 
 
 def test_cmd_stop_kills_running_job(monkeypatch, capsys):
@@ -379,7 +379,7 @@ def test_cmd_stop_kills_running_job(monkeypatch, capsys):
 
     monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(gq.os, "killpg", fake_killpg)
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
     assert calls["getpgid"] == 12345
     assert calls["killpg"] == (99999, signal.SIGKILL)
@@ -398,7 +398,7 @@ def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
     killed = []
     monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
     assert "already finished" in out or "not found" in out
     assert killed == []  # must NOT have called killpg
@@ -408,9 +408,9 @@ def test_cmd_stop_pid_none_treated_as_no_job(capsys):
     """running entry exists but pid is None (job not fully started) → no job."""
     gq.write_state({"daemon_pid": None,
                     "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": None}}})
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
-    assert "no job currently running" in out
+    assert "no pid" in out.lower() or "not fully started" in out.lower()
 
 
 def test_format_elapsed():
@@ -990,3 +990,88 @@ def test_second_ctrl_c_kills_all_running(tmp_path, monkeypatch):
     gq._force_kill_all_running()
     # Both process groups were SIGKILLed.
     assert sorted(killed) == [100, 200]
+
+
+# ---------------------------------------------------------------------------
+# Task 4: cmd_stop <id>, cmd_list cards column, multi-orphan crash recovery
+# ---------------------------------------------------------------------------
+
+def test_cmd_stop_requires_id(capsys):
+    """gq stop with no matching id -> error, no kill."""
+    gq.write_state({"daemon_pid": None, "running": {}})
+    gq.cmd_stop(_args(job_id="zzzz"))
+    out = capsys.readouterr().out
+    assert "no running job" in out.lower() or "not found" in out.lower()
+
+
+def test_cmd_stop_stops_named_job(monkeypatch, capsys):
+    """With two running jobs, gq stop <id> kills only the named one."""
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1},
+        "cd34": {"id": "cd34", "cmd": "y", "pid": 222, "cards": [1], "n": 1},
+    }})
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", lambda pid: pid * 10)
+    monkeypatch.setattr(gq.os, "killpg",
+                        lambda pgid, sig: killed.append(pgid))
+    gq.cmd_stop(_args(job_id="ab12"))
+    out = capsys.readouterr().out
+    assert "stopped job ab12" in out
+    assert killed == [1110]  # only ab12's group (111*10), not cd34's
+
+
+def test_cmd_stop_unknown_id(capsys):
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1}}})
+    gq.cmd_stop(_args(job_id="zz99"))
+    out = capsys.readouterr().out
+    assert "not found" in out.lower() or "no running job" in out.lower()
+
+
+def test_cmd_list_shows_cards(tmp_path, monkeypatch, capsys):
+    """Running jobs show their assigned GPU cards."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun train.py", "cwd": str(tmp_path),
+                 "pid": 111, "cards": [0, 1], "n": 2,
+                 "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                 "env": {}}}})
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "GPU 0,1" in out or "0,1" in out
+    assert "torchrun train.py" in out
+
+
+def test_cmd_watch_crash_recovery_multiple_orphans(monkeypatch, capsys, tmp_path):
+    """Startup clears multiple orphaned running entries."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    # Two running entries: one alive, one dead
+    gq.write_state({"daemon_pid": 99999, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1},
+        "cd34": {"id": "cd34", "cmd": "y", "pid": 222, "cards": [1], "n": 1}}})
+    # pid 111 alive, pid 222 dead
+    def fake_getpgid(pid):
+        if pid == 222:
+            raise ProcessLookupError
+        return pid
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append(pgid))
+    # os.kill for daemon-pid check: daemon 99999 dead
+    monkeypatch.setattr(gq.os, "kill",
+                        lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError)
+                        if pid == 99999 else None)
+    # Stop the loop immediately
+    monkeypatch.setattr(gq, "_daemon_loop",
+                        lambda poll: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        gq.cmd_watch(_args(poll=1))
+    except KeyboardInterrupt:
+        pass
+    assert 111 in killed or 1110 in killed  # the alive orphan's group was killed
+    state = gq.read_state()
+    assert state["running"] == {}  # all cleared

@@ -244,13 +244,14 @@ def cmd_list(args) -> None:
         for rid, r in running.items():
             try:
                 started = datetime.datetime.fromisoformat(r["started_at"])
-                elapsed = datetime.datetime.now() - started
-                elapsed_str = str(elapsed).split(".")[0]  # drop microseconds
+                elapsed = str(datetime.datetime.now() - started).split(".")[0]
             except (KeyError, ValueError, TypeError):
-                elapsed_str = "unknown"
+                elapsed = "unknown"
+            cards = ",".join(str(c) for c in r.get("cards", []))
             ename = _env_name(r)
             suffix = f"  [{ename}]" if ename else ""
-            print(f"  {rid}  {r['cmd']}   started {elapsed_str} ago{suffix}")
+            gpu = f"  GPU {cards}" if cards else ""
+            print(f"  {rid}  {r['cmd']}{gpu}   started {elapsed} ago{suffix}")
     else:
         print("[gq] running: none")
 
@@ -316,38 +317,39 @@ def cmd_clear(args) -> None:
 
 
 def cmd_stop(args) -> None:
-    """Stop a running job (SIGKILL its process group).
+    """Stop a specific running job by ID (SIGKILL its process group).
 
-    Reads state.running (now a dict keyed by job id) and kills the first
-    running job that has a pid. With the concurrent model multiple jobs may
-    run at once; selecting by id is added in a later task. The daemon is NOT
-    signaled: it reaps the killed job on its next poll cycle, releasing the
-    cards. Run from any window; no need to switch to the daemon terminal.
+    With multiple jobs running concurrently, an ID is required. The daemon
+    stays alive and reaps the killed job, releasing its cards.
     """
     state = read_state()
     running = state.get("running") or {}
-    target = None
-    rpid = None
-    for rid, r in running.items():
-        pid = r.get("pid")
-        if pid:
-            target, rpid = rid, pid
-            break
+    job_id = args.job_id
 
-    if not rpid:
-        print("[gq] no job currently running.")
+    matches = [jid for jid in running if jid.startswith(job_id)]
+    if not matches:
+        print(f"[gq] no running job matches '{job_id}'.")
+        return
+    if len(matches) > 1:
+        ids = ", ".join(matches)
+        print(f"[gq] ambiguous prefix '{job_id}' matches: {ids}. Be more specific.")
         return
 
+    target_id = matches[0]
+    rpid = running[target_id].get("pid")
+    if not rpid:
+        print(f"[gq] job {target_id} has no pid yet (not fully started).")
+        return
     try:
         pgid = os.getpgid(rpid)
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
-        print(f"[gq] job {target} already finished (pid {rpid} not found).")
+        print(f"[gq] job {target_id} already finished (pid {rpid} not found).")
         return
     except PermissionError as exc:
-        print(f"[gq] ERROR: cannot stop job {target} (pid {rpid}): {exc}")
+        print(f"[gq] ERROR: cannot stop job {target_id} (pid {rpid}): {exc}")
         return
-    print(f"[gq] stopped job {target} (pid {rpid}).")
+    print(f"[gq] stopped job {target_id} (pid {rpid}).")
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -574,7 +576,8 @@ def main():
 
     sub.add_parser("clear", help="Clear all pending jobs")
 
-    sub.add_parser("stop", help="Stop the currently-running job")
+    p_stop = sub.add_parser("stop", help="Stop a running job by ID")
+    p_stop.add_argument("job_id", help="Job ID or unique prefix")
 
     args = parser.parse_args()
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
