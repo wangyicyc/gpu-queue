@@ -420,8 +420,14 @@ def _daemon_loop(poll_interval: int) -> None:
 
     old_handler = signal.signal(signal.SIGINT, _handle_sigint)
     try:
-        while not _shutdown_requested:
-            # 1. Reap finished jobs.
+        # Keep looping while not shutting down OR there are still live jobs to
+        # reap. After the first Ctrl-C sets _shutdown_requested, the loop drains
+        # _running (reaping finished jobs) but does NOT launch new ones — the
+        # launch block below is gated on `not _shutdown_requested`. Only when
+        # every live job has been reaped does the loop exit, so graceful Ctrl-C
+        # no longer orphans jobs that are still running on the GPU.
+        while not _shutdown_requested or _running:
+            # 1. Reap finished jobs (always, even after shutdown requested).
             for rid in list(_running.keys()):
                 info = _running[rid]
                 code = info["proc"].poll()
@@ -436,36 +442,39 @@ def _daemon_loop(poll_interval: int) -> None:
                     _state.setdefault("running", {}).pop(rid, None)
                     write_state(_state)
 
-            # 2. Try to launch the queue head if enough idle cards.
-            total = _total_cards()
-            busy = busy_cards()
-            idle = set(range(total)) - busy
-            # Cards already assigned to running jobs are not idle even if
-            # nvidia-smi hasn't caught up.
-            assigned = set()
-            for info in _running.values():
-                assigned.update(info["cards"])
-            idle = idle - assigned
+            # 2. Launch the queue head ONLY if not shutting down AND enough idle
+            # cards. After graceful shutdown is requested, skip launching so no
+            # new jobs start while we drain the live ones.
+            if not _shutdown_requested:
+                total = _total_cards()
+                busy = busy_cards()
+                idle = set(range(total)) - busy
+                # Cards already assigned to running jobs are not idle even if
+                # nvidia-smi hasn't caught up.
+                assigned = set()
+                for info in _running.values():
+                    assigned.update(info["cards"])
+                idle = idle - assigned
 
-            with _locked_queue() as q:
-                if q:
-                    head = q[0]
-                    n = head.get("n", 1)
-                    if len(idle) >= n:
-                        q.pop(0)
-                        cards = _pick_idle(idle, n)
-                        proc = _launch_job(head, cards)
-                        if proc is not None:
-                            head["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-                            _running[head["id"]] = {"proc": proc, "job": head,
-                                                    "cards": cards, "start": time.monotonic()}
-                            _state = read_state()
-                            _state.setdefault("running", {})[head["id"]] = {
-                                **head, "cards": cards, "pid": proc.pid
-                            }
-                            write_state(_state)
-                            print(f"\n[gq] GPU idle — starting job {head['id']} on "
-                                  f"GPU {','.join(str(c) for c in cards)}")
+                with _locked_queue() as q:
+                    if q:
+                        head = q[0]
+                        n = head.get("n", 1)
+                        if len(idle) >= n:
+                            q.pop(0)
+                            cards = _pick_idle(idle, n)
+                            proc = _launch_job(head, cards)
+                            if proc is not None:
+                                head["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                                _running[head["id"]] = {"proc": proc, "job": head,
+                                                        "cards": cards, "start": time.monotonic()}
+                                _state = read_state()
+                                _state.setdefault("running", {})[head["id"]] = {
+                                    **head, "cards": cards, "pid": proc.pid
+                                }
+                                write_state(_state)
+                                print(f"\n[gq] GPU idle — starting job {head['id']} on "
+                                      f"GPU {','.join(str(c) for c in cards)}")
 
             time.sleep(poll_interval)
     finally:
@@ -528,11 +537,17 @@ def cmd_watch(args) -> None:
     try:
         _daemon_loop(args.poll)
     finally:
-        # Clean up daemon_pid on exit, and clear any running entry left by a
-        # force-kill mid-job (graceful exits already clear reaped entries).
+        # Clear only the daemon_pid. Do NOT blanket-clear state["running"]:
+        # on a graceful exit the loop has already drained _running to empty
+        # (each reaped job is popped from state["running"] as it finishes), so
+        # state["running"] is already {}. On a force-kill (2nd Ctrl-C),
+        # _force_kill_all_running SIGKILLed the process groups but they may
+        # not have been reaped yet — leaving state["running"] lets the next
+        # `gq watch` reap them via crash-recovery (live orphans are killed,
+        # dead entries are cleared as stale). Clearing here would orphan jobs
+        # that are still alive on the GPU.
         s = read_state()
         s["daemon_pid"] = None
-        s["running"] = {}
         write_state(s)
 
 

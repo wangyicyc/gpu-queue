@@ -897,6 +897,73 @@ def test_daemon_reaps_finished_job(tmp_path, monkeypatch):
     assert job["id"] not in state["running"]  # reaped
 
 
+def test_graceful_shutdown_drains_running_and_skips_launch(tmp_path, monkeypatch):
+    """First Ctrl-C requests graceful shutdown: the loop must keep reaping the
+    live job until it finishes (NOT exit immediately) and must NOT launch the
+    queued head after shutdown is requested."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    launched = []
+    monkeypatch.setattr(gq.subprocess, "Popen",
+                        lambda *a, **kw: launched.append(a) or _FakeProc(pid=777))
+
+    # A pre-seeded running job + a queued head that must NOT launch post-shutdown.
+    running_job = gq._make_job("running", str(tmp_path), n=1)
+    running_job["started_at"] = "2026-07-10T00:00:00"
+    queued_job = gq._make_job("queued", str(tmp_path), n=1)
+    gq.write_queue([queued_job])
+    gq.write_state({"daemon_pid": os.getpid(),
+                    "running": {running_job["id"]:
+                                {**running_job, "cards": [0], "pid": 555}}})
+
+    proc = _FakeProc(pid=555, exitcode=None)
+    poll_calls = [0]
+
+    def fake_poll():
+        poll_calls[0] += 1
+        if poll_calls[0] == 1:
+            # First Ctrl-C lands during the first reap: request graceful
+            # shutdown while the job is still running (poll() -> None).
+            gq._shutdown_requested = True
+            return None
+        return 0  # finished on the second reap
+
+    proc.poll = fake_poll
+
+    # Pre-seed the module-level _running so the daemon adopts the live proc.
+    monkeypatch.setattr(gq, "_running",
+                        {running_job["id"]: {"proc": proc, "job": running_job,
+                                             "cards": [0], "start": 0.0}})
+
+    # Safety valve: if the loop fails to drain and exit, force exit.
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 5:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    # The queued head was NOT launched: launch block is gated after shutdown.
+    assert launched == []
+    # The running job WAS reaped before exit (loop drained instead of bailing).
+    assert gq._running == {}
+    state = gq.read_state()
+    assert state["running"] == {}
+    # The queued job is still queued (not launched, not dropped).
+    assert [j["id"] for j in gq.read_queue()] == [queued_job["id"]]
+
+
 def test_pick_idle_returns_lowest_n():
     assert gq._pick_idle({3, 1, 4, 1, 5}, 2) == [1, 3]
     assert gq._pick_idle(set(), 1) == []
