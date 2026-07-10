@@ -59,7 +59,8 @@ assert_equals_sorted "gq <Tab> lists subcommands" \
 add
 list
 cancel
-clear" \
+clear
+stop" \
     "$out"
 
 # ---- Scenario 2: gq add train<Tab> completes matching files ----
