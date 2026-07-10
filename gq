@@ -268,6 +268,37 @@ def cmd_clear(args) -> None:
     print(f"[gq] cleared {n} pending job{'s' if n != 1 else ''}.")
 
 
+def cmd_stop(args) -> None:
+    """Stop the currently-running job (SIGKILL its process group).
+
+    Reads state.running.pid and kills the whole process group — the same
+    operation crash-recovery uses on daemon restart. The daemon is NOT
+    signaled: it is blocked in proc.wait(), which returns when the job is
+    killed, then it clears running and continues to the next queued job.
+    Run from any window; no need to switch to the daemon terminal.
+    """
+    state = read_state()
+    running = state.get("running")
+    rpid = running.get("pid") if running else None
+
+    if not rpid:
+        print("[gq] no job currently running.")
+        return
+
+    try:
+        pgid = os.getpgid(rpid)
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        print(f"[gq] job {running.get('id')} already finished "
+              f"(pid {rpid} not found).")
+        return
+    except PermissionError as exc:
+        print(f"[gq] ERROR: cannot stop job {running.get('id')} "
+              f"(pid {rpid}): {exc}")
+        return
+    print(f"[gq] stopped job {running.get('id')} (pid {rpid}).")
+
+
 def _format_elapsed(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
     s = int(seconds)
@@ -481,6 +512,8 @@ def main():
 
     sub.add_parser("clear", help="Clear all pending jobs")
 
+    sub.add_parser("stop", help="Stop the currently-running job")
+
     args = parser.parse_args()
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -490,6 +523,7 @@ def main():
         "list": cmd_list,
         "cancel": cmd_cancel,
         "clear": cmd_clear,
+        "stop": cmd_stop,
     }
     dispatch[args.cmd](args)
 

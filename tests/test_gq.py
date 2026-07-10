@@ -317,6 +317,63 @@ def test_cmd_clear_removes_all(tmp_path, monkeypatch, capsys):
     assert "2" in out
 
 
+def test_cmd_stop_no_running_job(capsys):
+    """gq stop with no running job → message, no kill attempted."""
+    gq.write_state({"daemon_pid": None, "running": None})
+    gq.cmd_stop(_args())
+    out = capsys.readouterr().out
+    assert "no job currently running" in out
+
+
+def test_cmd_stop_kills_running_job(monkeypatch, capsys):
+    """gq stop SIGKILLs the running job's process group via its pid."""
+    gq.write_state({"daemon_pid": None,
+                    "running": {"id": "ab12", "cmd": "x", "pid": 12345}})
+    calls = {"getpgid": None, "killpg": None}
+
+    def fake_getpgid(pid):
+        calls["getpgid"] = pid
+        return 99999  # the process group id
+
+    def fake_killpg(pgid, sig):
+        calls["killpg"] = (pgid, sig)
+
+    monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(gq.os, "killpg", fake_killpg)
+    gq.cmd_stop(_args())
+    out = capsys.readouterr().out
+    assert calls["getpgid"] == 12345
+    assert calls["killpg"] == (99999, signal.SIGKILL)
+    assert "stopped job ab12" in out
+    assert "12345" in out
+
+
+def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
+    """If the pid is already gone (ProcessLookupError), report gracefully."""
+    gq.write_state({"daemon_pid": None,
+                    "running": {"id": "ab12", "cmd": "x", "pid": 12345}})
+
+    def fake_getpgid(pid):
+        raise ProcessLookupError
+
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    gq.cmd_stop(_args())
+    out = capsys.readouterr().out
+    assert "already finished" in out or "not found" in out
+    assert killed == []  # must NOT have called killpg
+
+
+def test_cmd_stop_pid_none_treated_as_no_job(capsys):
+    """running entry exists but pid is None (job not fully started) → no job."""
+    gq.write_state({"daemon_pid": None,
+                    "running": {"id": "ab12", "cmd": "x", "pid": None}})
+    gq.cmd_stop(_args())
+    out = capsys.readouterr().out
+    assert "no job currently running" in out
+
+
 def test_format_elapsed():
     assert gq._format_elapsed(0) == "00:00:00"
     assert gq._format_elapsed(90) == "00:01:30"
