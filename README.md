@@ -59,7 +59,7 @@ gq list
 
 ```
 [gq] running:
-  3f1a  python train.py --seed 1   started 0:04:12 ago  [myenv]
+  3f1a  python train.py --seed 1  GPU 0   started 0:04:12 ago  [myenv]
 
 [gq] queue (1 job):
   #1  a9c2  python train.py --seed 2  [myenv]
@@ -225,7 +225,7 @@ cd gpu-queue
 python -m pytest tests/ -v
 ```
 
-38 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复。
+71 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复。
 
 ### 限制
 
@@ -289,7 +289,7 @@ gq list
 
 ```
 [gq] running:
-  3f1a  python train.py --seed 1   started 0:04:12 ago  [myenv]
+  3f1a  python train.py --seed 1  GPU 0   started 0:04:12 ago  [myenv]
 
 [gq] queue (1 job):
   #1  a9c2  python train.py --seed 2  [myenv]
@@ -432,7 +432,7 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 ### Tests
 
 ```bash
-python -m pytest tests/ -v    # 38 tests
+python -m pytest tests/ -v    # 71 tests
 ```
 
 ### Limitations

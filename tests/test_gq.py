@@ -964,6 +964,125 @@ def test_graceful_shutdown_drains_running_and_skips_launch(tmp_path, monkeypatch
     assert [j["id"] for j in gq.read_queue()] == [queued_job["id"]]
 
 
+def test_daemon_launches_multiple_jobs_per_cycle_disjoint_cards(tmp_path, monkeypatch):
+    """Two n=2 jobs queued on a 4-card box, all idle (busy_cards=set() to
+    simulate nvidia-smi lag). The launch loop must start BOTH in one cycle on
+    DISJOINT card sets — the `idle = idle - set(cards)` reservation is the ONLY
+    thing preventing a collision here. This test fails if that reservation line
+    is removed."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 4)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())  # all idle, smi lag
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    pids = iter(range(1000, 9999))
+    launched = []
+
+    def fake_popen(cmd, *a, **kw):
+        p = _FakeProc(pid=next(pids))
+        launched.append({"cmd": cmd, "env": kw.get("env"), "pid": p.pid})
+        return p
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+
+    job_a = gq._make_job("trainA", str(tmp_path), n=2)
+    job_b = gq._make_job("trainB", str(tmp_path), n=2)
+    gq.write_queue([job_a, job_b])
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    # Both jobs launched in the single cycle.
+    assert len(launched) == 2, f"expected 2 launches, got {len(launched)}"
+    # Both recorded in _running / state.
+    state = gq.read_state()
+    assert job_a["id"] in state["running"]
+    assert job_b["id"] in state["running"]
+    cards_a = set(state["running"][job_a["id"]]["cards"])
+    cards_b = set(state["running"][job_b["id"]]["cards"])
+    # Disjoint card sets whose union is all 4 cards.
+    assert cards_a.isdisjoint(cards_b), f"card collision: {cards_a} & {cards_b}"
+    assert cards_a | cards_b == {0, 1, 2, 3}
+    # Each got exactly 2 cards.
+    assert len(cards_a) == 2 and len(cards_b) == 2
+    # The queue is drained (both popped in one cycle).
+    assert gq.read_queue() == []
+
+
+def test_daemon_reap_frees_cards_then_launches_next(tmp_path, monkeypatch):
+    """Cycle 1: job A (n=2 on cards {0,1}) is pre-seeded running and finishes
+    (poll->0); reap frees {0,1}; the launch block then starts queued job B
+    (n=2) on the now-free cards. Verifies reap runs before launch in the cycle
+    and that freed cards are reusable."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 4)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+
+    # Job A pre-seeded as running; its proc finishes immediately (poll -> 0).
+    job_a = gq._make_job("runA", str(tmp_path), n=2)
+    job_a["started_at"] = "2026-07-10T00:00:00"
+    proc_a = _FakeProc(pid=555, exitcode=0)
+    monkeypatch.setattr(gq, "_running",
+                        {job_a["id"]: {"proc": proc_a, "job": job_a,
+                                       "cards": [0, 1], "start": 0.0}})
+    gq.write_state({"daemon_pid": os.getpid(),
+                    "running": {job_a["id"]:
+                                {**job_a, "cards": [0, 1], "pid": 555}}})
+
+    # Job B queued, needs 2 cards.
+    job_b = gq._make_job("runB", str(tmp_path), n=2)
+    gq.write_queue([job_b])
+
+    launched = []
+
+    def fake_popen(cmd, *a, **kw):
+        p = _FakeProc(pid=777)
+        launched.append({"env": kw.get("env")})
+        return p
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    state = gq.read_state()
+    # Job A reaped (removed from running + state).
+    assert job_a["id"] not in state["running"]
+    assert job_a["id"] not in gq._running
+    # Job B launched in the same cycle, got 2 cards (the freed {0,1}).
+    assert job_b["id"] in state["running"]
+    assert len(launched) == 1
+    cards_b = state["running"][job_b["id"]]["cards"]
+    assert len(cards_b) == 2
+    assert set(cards_b) == {0, 1}
+
+
 def test_pick_idle_returns_lowest_n():
     assert gq._pick_idle({3, 1, 4, 1, 5}, 2) == [1, 3]
     assert gq._pick_idle(set(), 1) == []

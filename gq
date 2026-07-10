@@ -444,39 +444,53 @@ def _daemon_loop(poll_interval: int) -> None:
                     _state.setdefault("running", {}).pop(rid, None)
                     write_state(_state)
 
-            # 2. Launch the queue head ONLY if not shutting down AND enough idle
-            # cards. After graceful shutdown is requested, skip launching so no
-            # new jobs start while we drain the live ones.
+            # 2. Launch as many queued jobs as fit the idle cards this cycle
+            # (NOT just the head) so concurrent multi-GPU jobs start together
+            # instead of being staggered by poll_interval seconds each. After
+            # graceful shutdown is requested, skip launching so no new jobs
+            # start while we drain the live ones.
             if not _shutdown_requested:
                 total = _total_cards()
                 busy = busy_cards()
-                idle = set(range(total)) - busy
                 # Cards already assigned to running jobs are not idle even if
                 # nvidia-smi hasn't caught up.
                 assigned = set()
                 for info in _running.values():
                     assigned.update(info["cards"])
-                idle = idle - assigned
+                idle = set(range(total)) - busy - assigned
 
-                with _locked_queue() as q:
-                    if q:
+                # Launch in a loop: re-derive idle (subtracting each just-launched
+                # job's cards) so the next job gets DIFFERENT cards. Strict FIFO:
+                # if the head doesn't fit, break — don't skip to smaller jobs.
+                while True:
+                    with _locked_queue() as q:
+                        if not q:
+                            break
                         head = q[0]
                         n = head.get("n", 1)
-                        if len(idle) >= n:
-                            q.pop(0)
-                            cards = _pick_idle(idle, n)
-                            proc = _launch_job(head, cards)
-                            if proc is not None:
-                                head["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-                                _running[head["id"]] = {"proc": proc, "job": head,
-                                                        "cards": cards, "start": time.monotonic()}
-                                _state = read_state()
-                                _state.setdefault("running", {})[head["id"]] = {
-                                    **head, "cards": cards, "pid": proc.pid
-                                }
-                                write_state(_state)
-                                print(f"\n[gq] GPU idle — starting job {head['id']} on "
-                                      f"GPU {','.join(str(c) for c in cards)}")
+                        if len(idle) < n:
+                            break  # head doesn't fit; don't skip (strict FIFO)
+                        q.pop(0)
+                    cards = _pick_idle(idle, n)
+                    proc = _launch_job(head, cards)
+                    if proc is not None:
+                        head["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                        _running[head["id"]] = {"proc": proc, "job": head,
+                                                "cards": cards, "start": time.monotonic()}
+                        _state = read_state()
+                        _state.setdefault("running", {})[head["id"]] = {
+                            **head, "cards": cards, "pid": proc.pid
+                        }
+                        write_state(_state)
+                        print(f"\n[gq] GPU idle — starting job {head['id']} on "
+                              f"GPU {','.join(str(c) for c in cards)}")
+                        # Reserve these cards so the next iteration picks
+                        # different ones.
+                        idle = idle - set(cards)
+                    else:
+                        # launch failed (bad cwd) — job already popped; don't
+                        # loop forever trying to re-launch it.
+                        break
 
             time.sleep(poll_interval)
     finally:
