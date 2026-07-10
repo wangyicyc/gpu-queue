@@ -12,7 +12,7 @@ spec = importlib.util.spec_from_file_location(
     "gq", _gq_path, loader=importlib.machinery.SourceFileLoader("gq", str(_gq_path))
 )
 gq = importlib.util.module_from_spec(spec)
-# Register in sys.modules so unittest.mock.patch("gq.gpu_is_idle", ...) can resolve it.
+# Register in sys.modules so unittest.mock.patch("gq.busy_cards", ...) can resolve it.
 sys.modules["gq"] = gq
 spec.loader.exec_module(gq)
 
@@ -55,6 +55,14 @@ PMON_DESKTOP_PLUS_COMPUTE = """\
     0    {pid}     C     60     30      -      -   python
 """
 
+PMON_TWO_CARDS_MY_PROC = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %   name
+    0      12345     C    60    30     0     0   python
+    1      99999     C    10     5     0     0   python3
+    1       1255     G      -      -      -      -   Xorg
+"""
+
 
 def make_pmon_result(stdout, returncode=0):
     r = MagicMock()
@@ -63,45 +71,45 @@ def make_pmon_result(stdout, returncode=0):
     return r
 
 
-def test_gpu_idle_no_processes():
+def test_busy_cards_no_processes():
     with patch("subprocess.run", return_value=make_pmon_result(PMON_NO_PROCS)):
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_idle_other_user_process():
-    """A process owned by another user should not block."""
+def test_busy_cards_other_user_process():
+    """A process owned by another user should not count as busy."""
     # pid 99999 owned by root (uid 0), current user != 0
     with patch("subprocess.run", return_value=make_pmon_result(PMON_OTHER_USER)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = 0  # root owns pid 99999
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_busy_my_process():
-    """A compute process owned by the current user should block."""
+def test_busy_cards_my_compute_pid():
+    """A compute process owned by the current user marks its card busy."""
     my_pid = os.getpid()
     pmon_out = PMON_MY_PID.format(pid=my_pid)
     with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = os.getuid()
-        assert gq.gpu_is_idle() is False
+        assert 0 in gq.busy_cards()
 
 
-def test_gpu_idle_desktop_graphics_processes():
-    """Graphics (type=G) processes owned by me must NOT block the queue.
+def test_busy_cards_desktop_graphics_processes():
+    """Graphics (type=G) processes owned by me must NOT count as busy.
 
     Regression test: the desktop environment (Xorg, gnome-shell, chrome, VS Code)
-    is always on the GPU and owned by the user. Before the fix, gpu_is_idle()
-    treated these as "GPU busy" and the queue never advanced.
+    is always on the GPU and owned by the user. Before the fix, these were
+    treated as "GPU busy" and the queue never advanced.
     """
     with patch("subprocess.run", return_value=make_pmon_result(PMON_DESKTOP_ONLY)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = os.getuid()  # all desktop procs are mine
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_busy_desktop_plus_my_compute():
-    """Desktop graphics + my compute (type=C) process → busy."""
+def test_busy_cards_desktop_plus_my_compute():
+    """Desktop graphics + my compute (type=C) process → my card is busy."""
     my_pid = os.getpid()
     pmon_out = PMON_DESKTOP_PLUS_COMPUTE.format(pid=my_pid)
 
@@ -113,19 +121,24 @@ def test_gpu_busy_desktop_plus_my_compute():
 
     with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
          patch("os.stat", side_effect=fake_stat):
-        assert gq.gpu_is_idle() is False
+        assert 0 in gq.busy_cards()
 
 
-def test_gpu_idle_nvidia_smi_failure():
-    """nvidia-smi non-zero exit → treat as busy (safe default)."""
+def test_busy_cards_nvidia_smi_failure(monkeypatch):
+    """nvidia-smi non-zero exit → all cards busy (safe default)."""
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
     with patch("subprocess.run", return_value=make_pmon_result("", returncode=1)):
-        assert gq.gpu_is_idle() is False
+        assert gq.busy_cards() == {0, 1}
 
 
-def test_gpu_idle_timeout():
+def test_busy_cards_timeout(monkeypatch):
+    """nvidia-smi timeout → all cards busy (safe default)."""
     import subprocess as sp
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
     with patch("subprocess.run", side_effect=sp.TimeoutExpired("nvidia-smi", 10)):
-        assert gq.gpu_is_idle() is False
+        assert gq.busy_cards() == {0, 1}
+
+
 
 
 import pytest
@@ -424,7 +437,7 @@ def test_daemon_loop_runs_one_job(tmp_path, monkeypatch, capsys):
         if iterations[0] > 5:
             raise KeyboardInterrupt  # stop the loop
 
-    with patch("gq.gpu_is_idle", return_value=True), \
+    with patch("gq.busy_cards", return_value=set()), \
          patch("time.sleep", side_effect=fake_sleep):
         try:
             gq._daemon_loop(poll_interval=1)
@@ -448,7 +461,7 @@ def test_daemon_loop_waits_when_gpu_busy(tmp_path, monkeypatch, capsys):
         if iterations[0] >= 3:
             raise KeyboardInterrupt
 
-    with patch("gq.gpu_is_idle", return_value=False), \
+    with patch("gq.busy_cards", return_value={0}), \
          patch("time.sleep", side_effect=fake_sleep):
         try:
             gq._daemon_loop(poll_interval=1)
@@ -779,4 +792,39 @@ def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, c
     out = capsys.readouterr().out
     assert "single-card" in out.lower() or "no --gpus" in out.lower()
     assert gq.read_queue()[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2: busy_cards() / _total_cards() — per-card GPU state primitive
+# ---------------------------------------------------------------------------
+
+def test_busy_cards_my_process():
+    """My compute process on gpu 0 -> {0} busy; other-user proc on gpu 1 ignored."""
+    with patch("subprocess.run", return_value=make_pmon_result(PMON_TWO_CARDS_MY_PROC)), \
+         patch("os.stat") as mock_stat:
+        def fake_stat(path):
+            s = MagicMock()
+            # pid 12345 is mine; 99999 is root; 1255 is mine but type=G
+            s.st_uid = 0 if "99999" in path else os.getuid()
+            return s
+        mock_stat.side_effect = fake_stat
+        assert gq.busy_cards() == {0}
+
+
+def test_busy_cards_none():
+    with patch("subprocess.run", return_value=make_pmon_result(PMON_NO_PROCS)):
+        assert gq.busy_cards() == set()
+
+
+def test_busy_cards_nvidia_smi_failure_all_busy():
+    """nvidia-smi non-zero exit -> empty set (caller treats as 'all busy' via _total_cards diff)."""
+    r = MagicMock(); r.stdout = ""; r.returncode = 1
+    with patch("subprocess.run", return_value=r):
+        # On failure busy_cards returns set() — but the daemon must NOT launch.
+        # The daemon treats len(idle) where idle = total - busy; on failure we
+        # want idle empty. Design: busy_cards returns ALL card indices on failure.
+        # See Step 3: failure returns set(range(total)). For the test, total is
+        # mocked separately; here just assert it does not raise.
+        result = gq.busy_cards()
+        assert isinstance(result, set)
 

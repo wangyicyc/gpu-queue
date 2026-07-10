@@ -20,15 +20,37 @@ QUEUE_FILE = QUEUE_DIR / "queue.json"
 STATE_FILE = QUEUE_DIR / "state.json"
 
 
-def gpu_is_idle() -> bool:
-    """Return True if no compute (type=C) process owned by the current user is on the GPU.
+_TOTAL_CARDS = None  # type: Optional[int]
 
-    Only Compute-context processes (CUDA workloads, e.g. python training jobs) count
-    as "GPU busy". Graphics processes (type=G: Xorg, gnome-shell, chrome, VS Code, ...)
-    are the desktop environment and are always present — they must NOT block the queue,
-    or the GPU would never be reported idle.
+
+def _total_cards() -> int:
+    """Count GPUs via nvidia-smi -L. Cached after first call."""
+    global _TOTAL_CARDS
+    if _TOTAL_CARDS is not None:
+        return _TOTAL_CARDS
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True, text=True, timeout=10
+        )
+        # Each GPU is one line: "GPU 0: NVIDIA GeForce ..."
+        _TOTAL_CARDS = sum(1 for line in result.stdout.splitlines()
+                           if line.startswith("GPU "))
+        if _TOTAL_CARDS == 0:
+            _TOTAL_CARDS = 1  # fallback so idle math doesn't divide weirdly
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _TOTAL_CARDS = 1
+    return _TOTAL_CARDS
+
+
+def busy_cards() -> set:
+    """Return the set of physical GPU indices with a compute (type=C) process
+    owned by the current user. Graphics (type=G) and other users' processes
+    do not count. On nvidia-smi failure/timeout, returns ALL card indices
+    (safe default: daemon treats all as busy -> no launch).
     """
     uid = os.getuid()
+    total = _total_cards()
     try:
         result = subprocess.run(
             ["nvidia-smi", "pmon", "-s", "um", "-c", "1"],
@@ -39,31 +61,32 @@ def gpu_is_idle() -> bool:
               file=sys.stderr)
         sys.exit(1)
     except subprocess.TimeoutExpired:
-        print("[gq] WARNING: nvidia-smi timed out, treating GPU as busy.",
+        print("[gq] WARNING: nvidia-smi timed out, treating all GPUs as busy.",
               file=sys.stderr)
-        return False
+        return set(range(total))
 
     if result.returncode != 0:
         print(f"[gq] WARNING: nvidia-smi failed (exit {result.returncode}), "
-              "treating GPU as busy.", file=sys.stderr)
-        return False
+              "treating all GPUs as busy.", file=sys.stderr)
+        return set(range(total))
 
+    busy = set()
     for line in result.stdout.splitlines():
         if line.startswith("#") or not line.strip():
             continue
         parts = line.split()
-        # pmon columns: gpu  pid  type  ...  command  (type at index 2)
         if len(parts) < 3:
             continue
-        if parts[2] != "C":          # skip Graphics (G) — desktop environment
+        if parts[2] != "C":          # skip Graphics (G)
             continue
         try:
+            gpu = int(parts[0])
             pid = int(parts[1])
             if os.stat(f"/proc/{pid}").st_uid == uid:
-                return False
+                busy.add(gpu)
         except (ValueError, FileNotFoundError, PermissionError):
             continue
-    return True
+    return busy
 
 
 def _lock_and_read(path: Path, default):
@@ -399,7 +422,7 @@ def _daemon_loop(poll_interval: int) -> None:
                 time.sleep(poll_interval)
                 continue
 
-            if not gpu_is_idle():
+            if busy_cards():
                 time.sleep(poll_interval)
                 continue
 
