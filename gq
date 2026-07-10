@@ -241,7 +241,7 @@ def cmd_cancel(args) -> None:
     state = read_state()
     if state.get("running") and state["running"]["id"].startswith(job_id):
         print(f"[gq] job {state['running']['id']} is currently running. "
-              "Use Ctrl-C in the gq watch terminal to stop it.")
+              "Use 'gq stop' to stop it (the daemon stays alive).")
         return
 
     with _locked_queue() as q:

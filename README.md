@@ -124,7 +124,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 
 **`gq list`**　三段输出：运行中的任务（含已运行时长 + 环境名）、待跑队列（按顺序编号）、daemon 状态（running / stale pid / not running）。
 
-**`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务不能 cancel——去 daemon 终端按 Ctrl-C。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
+**`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务用 `gq stop` 停（daemon 继续跑下一个）。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
 
 **`gq clear`**　清空所有待跑任务，正在跑的不受影响。
 
@@ -334,7 +334,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 
 **`gq list`** — Three blocks: the running job (with elapsed time + env name), the pending queue (numbered in order), and the daemon status (running / stale pid / not running).
 
-**`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled this way — Ctrl-C the daemon instead. If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
+**`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled — use `gq stop` to stop it (the daemon moves on to the next job). If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
 
 **`gq clear`** — Clears all pending jobs; a running job is unaffected.
 
