@@ -69,6 +69,18 @@ gq list
 
 三段分别是：**正在跑的任务**（含已运行时长 + 环境名）、**待跑队列**（按顺序编号）、**daemon 状态**（running / stale pid / not running）。
 
+**多卡服务器：** 给任务指定要几张卡，gq 自动挑空闲卡分配。
+
+```bash
+# 8 卡服务器：这个任务要 4 张卡
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'
+# gq 挑 4 张空闲卡，注入 CUDA_VISIBLE_DEVICES=0,2,5,7 后跑
+# 多个任务可同时在不同卡上并行跑
+
+# 不指定 --gpus → 默认单卡（会提示一句）
+gq add 'python eval.py'
+```
+
 #### 一个任务的生命周期
 
 1. **`gq add`** —— 命令进入 `queue.json` 待跑队列。同时**快照**你当前的 shell 环境（conda/venv、PATH 等）和工作目录。
@@ -112,23 +124,23 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 | 命令 | 作用 |
 |------|------|
 | `gq watch [--poll N]` | 启动 daemon（默认 15 秒轮询；在 tmux 里跑） |
-| `gq add 'cmd'` | 追加任务到队尾（用当前目录作 cwd，快照当前环境） |
+| `gq add [--gpus N] 'cmd'` | 追加任务（--gpus N 指定要几张卡，默认 1） |
 | `gq list` | 查看运行中的任务 + 待跑队列 + daemon 状态 |
 | `gq cancel <id>` | 按 ID 或唯一前缀移除排队中的任务 |
 | `gq clear` | 清空所有待跑任务（不影响正在跑的） |
-| `gq stop` | 停掉当前正在跑的任务（daemon 继续接下一个） |
+| `gq stop <id>` | 停掉指定运行中的任务（daemon 继续接下一个） |
 
 **`gq watch [--poll N]`**　启动守护进程。若已有 daemon 在跑会拒绝启动。启动时做崩溃恢复：发现上次崩溃留下的孤儿任务进程会杀掉它的进程组再清状态。`--poll` 控制检查 GPU 的间隔（秒），默认 15。
 
-**`gq add '<command>'`**　把任意 shell 命令追加到队尾。命令用**当前目录**作为工作目录，并**快照当前环境**。例：`gq add 'bash run.sh'`、`gq add 'python -m foo.bar --x 1'`。
+**`gq add [--gpus N] '<command>'`**　把任意 shell 命令追加到队尾。命令用**当前目录**作为工作目录，并**快照当前环境**。`--gpus N` 指定要几张卡（默认 1）：gq 会挑 N 张空闲卡，执行时注入 `CUDA_VISIBLE_DEVICES=<那些卡>`（如 `CUDA_VISIBLE_DEVICES=0,2,5,7`），命令本身不用改（`--nproc_per_node=N` 跟 `--gpus N` 对上即可）。不指定 `--gpus` 时默认单卡，会提示一句。例：`gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'`、`gq add 'bash run.sh'`。
 
-**`gq list`**　三段输出：运行中的任务（含已运行时长 + 环境名）、待跑队列（按顺序编号）、daemon 状态（running / stale pid / not running）。
+**`gq list`**　三段输出：运行中的任务（含已运行时长 + 环境名 + 占用卡，多卡显示如 `GPU 0,1`）、待跑队列（按顺序编号）、daemon 状态（running / stale pid / not running）。
 
-**`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务用 `gq stop` 停（daemon 继续跑下一个）。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
+**`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务用 `gq stop <id>` 停（daemon 继续跑下一个）。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
 
 **`gq clear`**　清空所有待跑任务，正在跑的不受影响。
 
-**`gq stop`**　停掉**当前正在跑**的任务（SIGKILL 其进程组）。可在任意窗口执行，不用切到 daemon 终端按 Ctrl-C。daemon 不受影响，会接着跑队列里下一个任务。排队中的任务用 `cancel`，不是 `stop`。
+**`gq stop <id>`**　停掉**指定运行中**的任务（SIGKILL 其进程组）。必须给一个 `<id>`（运行中任务的 ID 或唯一前缀）；不给 id 会报错。可在任意窗口执行，不用切到 daemon 终端按 Ctrl-C。daemon 不受影响，会接着跑队列里下一个任务。排队中的任务用 `cancel`，不是 `stop`。
 
 ### 常见场景
 
@@ -152,7 +164,16 @@ gq cancel a9c2       # 或用前缀：gq cancel a9
 
 ```bash
 gq list              # 看到正在跑的是 3f1a，想停掉它
-gq stop              # 在任意窗口执行，立即杀掉，daemon 继续接下一个
+gq stop 3f1a         # 在任意窗口执行，立即杀掉，daemon 继续接下一个
+```
+
+**多卡并行跑：**
+
+```bash
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py --seed 1'
+gq add --gpus 2 'torchrun --nproc_per_node=2 train.py --seed 2'
+gq add --gpus 1 'python eval.py'
+# gq 会同时把任务分配到空闲卡上并行跑，卡用满就排队
 ```
 
 **daemon 崩溃 / 重启电脑后：** 重新 `gq watch` 即可。它会自动清理上次没跑完的孤儿进程，继续处理队列里剩下的任务。
@@ -208,8 +229,7 @@ python -m pytest tests/ -v
 
 ### 限制
 
-- 一次只跑一个任务（单 GPU、单用户场景设计）
-- 不支持多 GPU 调度、多用户、集群（那是 Slurm 的活）
+- 多卡并行：gq 按卡数自动分配，一次可在多张卡上并行跑多个任务。不支持多用户公平调度、集群（那是 Slurm 的活）
 - 任务会以前台方式打到 daemon 终端，没有独立日志文件（设计如此，用 tmux 的滚动缓冲即可）
 
 ### 许可证
@@ -279,6 +299,18 @@ gq list
 
 The three blocks are: the **running job** (with elapsed time + env name), the **pending queue** (numbered in order), and the **daemon status** (running / stale pid / not running).
 
+**Multi-GPU server:** tell a job how many cards it needs, and `gq` picks idle cards for it.
+
+```bash
+# 8-GPU server: this job wants 4 cards
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'
+# gq picks 4 idle cards, injects CUDA_VISIBLE_DEVICES=0,2,5,7, then runs
+# multiple jobs can run in parallel across different cards
+
+# no --gpus → defaults to a single card (prints a one-line notice)
+gq add 'python eval.py'
+```
+
 #### A job's lifecycle
 
 1. **`gq add`** — the command enters the pending queue in `queue.json`. It also **snapshots** your current shell environment (conda/venv, PATH, …) and working directory.
@@ -322,23 +354,23 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 | Command | Description |
 |---------|-------------|
 | `gq watch [--poll N]` | Start the daemon (default poll 15s; run in tmux) |
-| `gq add 'cmd'` | Append a job (uses current dir as cwd, snapshots current env) |
+| `gq add [--gpus N] 'cmd'` | Append a job (`--gpus N` sets how many cards, default 1) |
 | `gq list` | Show running job + pending queue + daemon status |
 | `gq cancel <id>` | Remove a pending job by ID or unique prefix |
 | `gq clear` | Clear all pending jobs (does not affect a running job) |
-| `gq stop` | Stop the currently-running job (daemon continues with the next) |
+| `gq stop <id>` | Stop a specific running job (daemon continues with the next) |
 
 **`gq watch [--poll N]`** — Starts the daemon. Refuses to start if a daemon is already running. On startup it performs crash recovery: if a previous crash left an orphaned job process, it kills that process group and clears the state. `--poll` sets the GPU-check interval in seconds (default 15).
 
-**`gq add '<command>'`** — Appends any shell command to the queue tail. The command runs with the **current directory** as its working directory and a **snapshot of the current environment**. e.g. `gq add 'bash run.sh'`, `gq add 'python -m foo.bar --x 1'`.
+**`gq add [--gpus N] '<command>'`** — Appends any shell command to the queue tail. The command runs with the **current directory** as its working directory and a **snapshot of the current environment**. `--gpus N` sets how many cards the job needs (default 1): `gq` picks N idle cards and injects `CUDA_VISIBLE_DEVICES=<those cards>` at run time (e.g. `CUDA_VISIBLE_DEVICES=0,2,5,7`) — the command itself stays unchanged (just keep `--nproc_per_node=N` matching `--gpus N`). Without `--gpus` it defaults to a single card and prints a one-line notice. e.g. `gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'`, `gq add 'bash run.sh'`.
 
-**`gq list`** — Three blocks: the running job (with elapsed time + env name), the pending queue (numbered in order), and the daemon status (running / stale pid / not running).
+**`gq list`** — Three blocks: the running job (with elapsed time + env name + cards used, multi-card shown like `GPU 0,1`), the pending queue (numbered in order), and the daemon status (running / stale pid / not running).
 
-**`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled — use `gq stop` to stop it (the daemon moves on to the next job). If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
+**`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled — use `gq stop <id>` to stop it (the daemon moves on to the next job). If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
 
 **`gq clear`** — Clears all pending jobs; a running job is unaffected.
 
-**`gq stop`** — Stops the **currently-running** job (SIGKILLs its process group). Run from any window — no need to switch to the daemon terminal and Ctrl-C. The daemon is unaffected and moves on to the next queued job. For a *pending* job, use `cancel`, not `stop`.
+**`gq stop <id>`** — Stops a **specific running** job (SIGKILLs its process group). You must pass an `<id>` (ID or unique prefix of a running job); running it with no id is an error. Run from any window — no need to switch to the daemon terminal and Ctrl-C. The daemon is unaffected and moves on to the next queued job. For a *pending* job, use `cancel`, not `stop`.
 
 ### Common scenarios
 
@@ -362,7 +394,16 @@ gq cancel a9c2      # or by prefix: gq cancel a9
 
 ```bash
 gq list             # see 3f1a is running, want to stop it
-gq stop             # run from any window; kills it immediately, daemon moves on
+gq stop 3f1a        # run from any window; kills it immediately, daemon moves on
+```
+
+**Run jobs in parallel across multiple cards:**
+
+```bash
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py --seed 1'
+gq add --gpus 2 'torchrun --nproc_per_node=2 train.py --seed 2'
+gq add --gpus 1 'python eval.py'
+# gq dispatches jobs onto idle cards in parallel; once cards are full, the rest queue
 ```
 
 **After a daemon crash / reboot:** just run `gq watch` again. It reaps any orphaned process from the previous run and resumes the remaining queue.
@@ -393,6 +434,11 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 ```bash
 python -m pytest tests/ -v    # 38 tests
 ```
+
+### Limitations
+
+- Multi-GPU parallelism: `gq` assigns jobs by card count and can run several jobs in parallel across multiple cards at once. No multi-user fair scheduling, no clustering (that's Slurm's job).
+- Job output streams to the daemon's foreground terminal — no separate log files (by design; use tmux's scrollback buffer).
 
 ### License
 
