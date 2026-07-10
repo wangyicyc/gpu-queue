@@ -36,7 +36,9 @@ gq --help
 
 ### 用法
 
-`gq` 是 daemon 模型：你在 tmux 里常驻一个 `gq watch` 守护进程，它盯着 GPU；你从别的窗口用 `gq add` 把命令丢进队列。GPU 一空闲，daemon 自动拖下一个任务跑，一个接一个，直到队列清空。
+`gq` 是 daemon 模型：你常驻一个 `gq watch` 守护进程，它盯着 GPU；你从别的窗口用 `gq add` 把命令丢进队列。GPU 一空闲，daemon 自动拖下一个任务跑，一个接一个，直到队列清空。
+
+> daemon 是前台常驻进程——关掉它所在终端，daemon 就会被杀。**tmux 不是必须的**：你开着终端不关就行；只有想关终端/断 SSH 后让任务继续跑，才需要 tmux（或 `nohup`）。
 
 #### 快速开始
 
@@ -114,6 +116,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 | `gq list` | 查看运行中的任务 + 待跑队列 + daemon 状态 |
 | `gq cancel <id>` | 按 ID 或唯一前缀移除排队中的任务 |
 | `gq clear` | 清空所有待跑任务（不影响正在跑的） |
+| `gq stop` | 停掉当前正在跑的任务（daemon 继续接下一个） |
 
 **`gq watch [--poll N]`**　启动守护进程。若已有 daemon 在跑会拒绝启动。启动时做崩溃恢复：发现上次崩溃留下的孤儿任务进程会杀掉它的进程组再清状态。`--poll` 控制检查 GPU 的间隔（秒），默认 15。
 
@@ -124,6 +127,8 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 **`gq cancel <id>`**　按完整 ID 或**唯一前缀**移除一个**排队中**的任务。正在跑的任务不能 cancel——去 daemon 终端按 Ctrl-C。前缀匹配多个任务时会列出所有匹配项并拒绝移除（让你写更具体的前缀）。
 
 **`gq clear`**　清空所有待跑任务，正在跑的不受影响。
+
+**`gq stop`**　停掉**当前正在跑**的任务（SIGKILL 其进程组）。可在任意窗口执行，不用切到 daemon 终端按 Ctrl-C。daemon 不受影响，会接着跑队列里下一个任务。排队中的任务用 `cancel`，不是 `stop`。
 
 ### 常见场景
 
@@ -141,6 +146,13 @@ gq list    # 确认 5 个都在队列里
 ```bash
 gq list              # 看到 #2 是 a9c2，想取消它
 gq cancel a9c2       # 或用前缀：gq cancel a9
+```
+
+**停掉跑错的任务（正在跑的那个）：**
+
+```bash
+gq list              # 看到正在跑的是 3f1a，想停掉它
+gq stop              # 在任意窗口执行，立即杀掉，daemon 继续接下一个
 ```
 
 **daemon 崩溃 / 重启电脑后：** 重新 `gq watch` 即可。它会自动清理上次没跑完的孤儿进程，继续处理队列里剩下的任务。
@@ -234,7 +246,9 @@ gq --help
 
 ### Usage
 
-`gq` is a daemon model: you keep a `gq watch` daemon running in tmux, and it watches the GPU; from another pane you `gq add` commands to the queue. The moment the GPU is idle, the daemon launches the next job, one after another, until the queue drains.
+`gq` is a daemon model: you keep a `gq watch` daemon running, and it watches the GPU; from another window you `gq add` commands to the queue. The moment the GPU is idle, the daemon launches the next job, one after another, until the queue drains.
+
+> The daemon is a foreground process — closing its terminal kills it. **tmux is not required**: just keep the terminal open; use tmux (or `nohup`) only if you want jobs to survive closing the terminal / dropping an SSH session.
 
 #### Quick start
 
@@ -312,6 +326,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 | `gq list` | Show running job + pending queue + daemon status |
 | `gq cancel <id>` | Remove a pending job by ID or unique prefix |
 | `gq clear` | Clear all pending jobs (does not affect a running job) |
+| `gq stop` | Stop the currently-running job (daemon continues with the next) |
 
 **`gq watch [--poll N]`** — Starts the daemon. Refuses to start if a daemon is already running. On startup it performs crash recovery: if a previous crash left an orphaned job process, it kills that process group and clears the state. `--poll` sets the GPU-check interval in seconds (default 15).
 
@@ -322,6 +337,8 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 **`gq cancel <id>`** — Remove a **pending** job by full ID or **unique prefix**. A running job cannot be cancelled this way — Ctrl-C the daemon instead. If a prefix matches multiple jobs, it lists them and removes nothing (so you can give a more specific prefix).
 
 **`gq clear`** — Clears all pending jobs; a running job is unaffected.
+
+**`gq stop`** — Stops the **currently-running** job (SIGKILLs its process group). Run from any window — no need to switch to the daemon terminal and Ctrl-C. The daemon is unaffected and moves on to the next queued job. For a *pending* job, use `cancel`, not `stop`.
 
 ### Common scenarios
 
@@ -339,6 +356,13 @@ gq list    # confirm all 5 are queued
 ```bash
 gq list             # see #2 is a9c2, want to drop it
 gq cancel a9c2      # or by prefix: gq cancel a9
+```
+
+**Stop a misbehaving running job (the one currently running):**
+
+```bash
+gq list             # see 3f1a is running, want to stop it
+gq stop             # run from any window; kills it immediately, daemon moves on
 ```
 
 **After a daemon crash / reboot:** just run `gq watch` again. It reaps any orphaned process from the previous run and resumes the remaining queue.
