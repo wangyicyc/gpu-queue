@@ -152,7 +152,7 @@ def write_state(state: dict) -> None:
     _lock_and_write(STATE_FILE, state)
 
 
-def _make_job(cmd: str, cwd: str) -> dict:
+def _make_job(cmd: str, cwd: str, n: int = 1) -> dict:
     return {
         "id": secrets.token_hex(2),
         "cmd": cmd,
@@ -163,13 +163,17 @@ def _make_job(cmd: str, cwd: str) -> dict:
         # the entire dict must be stored (conda/venv activation rewrites PATH and
         # sets many CONDA_* / VIRTUAL_ENV vars that a cherry-pick would drop).
         "env": dict(os.environ),
+        "n": n,
     }
 
 
 def cmd_add(args) -> None:
-    job = _make_job(args.command, os.getcwd())
+    n = args.gpus if args.gpus is not None else 1
+    job = _make_job(args.command, os.getcwd(), n=n)
     with _locked_queue() as q:
         q.append(job)
+    if args.gpus is None:
+        print(f"[gq] no --gpus given, running as single-card job")
     print(f"[gq] added job {job['id']}: {args.command}")
 
 
@@ -504,6 +508,8 @@ def main():
 
     p_add = sub.add_parser("add", help="Add a command to the queue")
     p_add.add_argument("command", help="Shell command to run")
+    p_add.add_argument("--gpus", type=int, default=None,
+                       help="Number of GPUs the job needs (default: 1, single-card)")
 
     sub.add_parser("list", help="Show queue and current status")
 

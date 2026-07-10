@@ -156,10 +156,11 @@ def test_write_then_read_queue():
 
 def test_make_job_fields():
     job = gq._make_job("python train.py", "/home/user/project")
-    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env"}
+    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env", "n"}
     assert job["cmd"] == "python train.py"
     assert job["cwd"] == "/home/user/project"
     assert isinstance(job["env"], dict)
+    assert job["n"] == 1
 
 
 def test_make_job_captures_env(monkeypatch):
@@ -229,7 +230,7 @@ def _args(**kwargs):
 
 def test_cmd_add_appends_to_queue(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo hi"))
+    gq.cmd_add(_args(command="echo hi", gpus=None))
     q = gq.read_queue()
     assert len(q) == 1
     assert q[0]["cmd"] == "echo hi"
@@ -238,7 +239,7 @@ def test_cmd_add_appends_to_queue(tmp_path, monkeypatch):
 
 def test_cmd_add_prints_job_id(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo hi"))
+    gq.cmd_add(_args(command="echo hi", gpus=None))
     out = capsys.readouterr().out
     assert "added job" in out
 
@@ -252,7 +253,7 @@ def test_cmd_list_empty(capsys):
 
 def test_cmd_list_shows_pending(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "python train.py" in out
@@ -260,7 +261,7 @@ def test_cmd_list_shows_pending(tmp_path, monkeypatch, capsys):
 
 def test_cmd_cancel_by_full_id(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo a"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
     job_id = gq.read_queue()[0]["id"]
     gq.cmd_cancel(_args(job_id=job_id))
     assert gq.read_queue() == []
@@ -270,7 +271,7 @@ def test_cmd_cancel_by_full_id(tmp_path, monkeypatch, capsys):
 
 def test_cmd_cancel_by_prefix(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo a"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
     job_id = gq.read_queue()[0]["id"]
     gq.cmd_cancel(_args(job_id=job_id[:2]))
     assert gq.read_queue() == []
@@ -295,8 +296,8 @@ def test_cmd_cancel_ambiguous_prefix(tmp_path, monkeypatch, capsys):
     """Ambiguous prefix matches multiple pending jobs → message, no removal."""
     monkeypatch.chdir(tmp_path)
     # Add two jobs, then force their IDs to share a 2-char prefix
-    gq.cmd_add(_args(command="echo a"))
-    gq.cmd_add(_args(command="echo b"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
+    gq.cmd_add(_args(command="echo b", gpus=None))
     queue = gq.read_queue()
     queue[0]["id"] = "ab12"
     queue[1]["id"] = "ab34"
@@ -309,8 +310,8 @@ def test_cmd_cancel_ambiguous_prefix(tmp_path, monkeypatch, capsys):
 
 def test_cmd_clear_removes_all(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="a"))
-    gq.cmd_add(_args(command="b"))
+    gq.cmd_add(_args(command="a", gpus=None))
+    gq.cmd_add(_args(command="b", gpus=None))
     gq.cmd_clear(_args())
     assert gq.read_queue() == []
     out = capsys.readouterr().out
@@ -535,7 +536,7 @@ def test_cmd_add_concurrent_no_lost_jobs(tmp_path, monkeypatch):
 
     def adder(n):
         for i in range(n):
-            gq.cmd_add(ap.Namespace(command=f"echo job{i}"))
+            gq.cmd_add(ap.Namespace(command=f"echo job{i}", gpus=None))
 
     threads = [threading.Thread(target=adder, args=(25,)) for _ in range(4)]
     for t in threads:
@@ -697,7 +698,7 @@ def test_cmd_list_shows_env_name(tmp_path, monkeypatch, capsys):
     """Pending rows show [envname] suffix when the job captured a conda env."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CONDA_DEFAULT_ENV", "myenv")
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "python train.py" in out
@@ -710,7 +711,7 @@ def test_cmd_list_shows_venv_name(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("VIRTUAL_ENV", "/home/u/.venvs/ml")
     # Ensure no conda var is set so venv path wins
     monkeypatch.delenv("CONDA_DEFAULT_ENV", raising=False)
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "[ml]" in out
@@ -750,4 +751,32 @@ def test_cmd_list_shows_env_name_running(tmp_path, monkeypatch, capsys):
     # The suffix should appear on the running row (not just a pending row,
     # since no pending jobs exist here).
     assert "python train.py" in out
+
+
+def test_make_job_stores_n():
+    job = gq._make_job("python x.py", "/tmp", n=4)
+    assert job["n"] == 4
+
+
+def test_make_job_default_n():
+    job = gq._make_job("python x.py", "/tmp")
+    assert job["n"] == 1
+
+
+def test_cmd_add_with_gpus(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gq.cmd_add(_args(command="python train.py", gpus=4))
+    q = gq.read_queue()
+    assert q[0]["n"] == 4
+
+
+def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    # argparse default: gpus=None; cmd_add detects "not explicitly given" via the
+    # None sentinel and prints the single-card notice. We pass gpus=None (the
+    # default) and expect the notice.
+    gq.cmd_add(_args(command="python train.py", gpus=None))
+    out = capsys.readouterr().out
+    assert "single-card" in out.lower() or "no --gpus" in out.lower()
+    assert gq.read_queue()[0]["n"] == 1
 
