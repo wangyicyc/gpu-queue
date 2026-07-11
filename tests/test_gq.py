@@ -1,5 +1,6 @@
 import importlib.util, importlib.machinery, sys, os
 import datetime
+import json
 import signal
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -12,7 +13,7 @@ spec = importlib.util.spec_from_file_location(
     "gq", _gq_path, loader=importlib.machinery.SourceFileLoader("gq", str(_gq_path))
 )
 gq = importlib.util.module_from_spec(spec)
-# Register in sys.modules so unittest.mock.patch("gq.gpu_is_idle", ...) can resolve it.
+# Register in sys.modules so unittest.mock.patch("gq.busy_cards", ...) can resolve it.
 sys.modules["gq"] = gq
 spec.loader.exec_module(gq)
 
@@ -55,6 +56,14 @@ PMON_DESKTOP_PLUS_COMPUTE = """\
     0    {pid}     C     60     30      -      -   python
 """
 
+PMON_TWO_CARDS_MY_PROC = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %   name
+    0      12345     C    60    30     0     0   python
+    1      99999     C    10     5     0     0   python3
+    1       1255     G      -      -      -      -   Xorg
+"""
+
 
 def make_pmon_result(stdout, returncode=0):
     r = MagicMock()
@@ -63,45 +72,45 @@ def make_pmon_result(stdout, returncode=0):
     return r
 
 
-def test_gpu_idle_no_processes():
+def test_busy_cards_no_processes():
     with patch("subprocess.run", return_value=make_pmon_result(PMON_NO_PROCS)):
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_idle_other_user_process():
-    """A process owned by another user should not block."""
+def test_busy_cards_other_user_process():
+    """A process owned by another user should not count as busy."""
     # pid 99999 owned by root (uid 0), current user != 0
     with patch("subprocess.run", return_value=make_pmon_result(PMON_OTHER_USER)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = 0  # root owns pid 99999
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_busy_my_process():
-    """A compute process owned by the current user should block."""
+def test_busy_cards_my_compute_pid():
+    """A compute process owned by the current user marks its card busy."""
     my_pid = os.getpid()
     pmon_out = PMON_MY_PID.format(pid=my_pid)
     with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = os.getuid()
-        assert gq.gpu_is_idle() is False
+        assert 0 in gq.busy_cards()
 
 
-def test_gpu_idle_desktop_graphics_processes():
-    """Graphics (type=G) processes owned by me must NOT block the queue.
+def test_busy_cards_desktop_graphics_processes():
+    """Graphics (type=G) processes owned by me must NOT count as busy.
 
     Regression test: the desktop environment (Xorg, gnome-shell, chrome, VS Code)
-    is always on the GPU and owned by the user. Before the fix, gpu_is_idle()
-    treated these as "GPU busy" and the queue never advanced.
+    is always on the GPU and owned by the user. Before the fix, these were
+    treated as "GPU busy" and the queue never advanced.
     """
     with patch("subprocess.run", return_value=make_pmon_result(PMON_DESKTOP_ONLY)), \
          patch("os.stat") as mock_stat:
         mock_stat.return_value.st_uid = os.getuid()  # all desktop procs are mine
-        assert gq.gpu_is_idle() is True
+        assert gq.busy_cards() == set()
 
 
-def test_gpu_busy_desktop_plus_my_compute():
-    """Desktop graphics + my compute (type=C) process → busy."""
+def test_busy_cards_desktop_plus_my_compute():
+    """Desktop graphics + my compute (type=C) process → my card is busy."""
     my_pid = os.getpid()
     pmon_out = PMON_DESKTOP_PLUS_COMPUTE.format(pid=my_pid)
 
@@ -113,19 +122,24 @@ def test_gpu_busy_desktop_plus_my_compute():
 
     with patch("subprocess.run", return_value=make_pmon_result(pmon_out)), \
          patch("os.stat", side_effect=fake_stat):
-        assert gq.gpu_is_idle() is False
+        assert 0 in gq.busy_cards()
 
 
-def test_gpu_idle_nvidia_smi_failure():
-    """nvidia-smi non-zero exit → treat as busy (safe default)."""
+def test_busy_cards_nvidia_smi_failure(monkeypatch):
+    """nvidia-smi non-zero exit → all cards busy (safe default)."""
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
     with patch("subprocess.run", return_value=make_pmon_result("", returncode=1)):
-        assert gq.gpu_is_idle() is False
+        assert gq.busy_cards() == {0, 1}
 
 
-def test_gpu_idle_timeout():
+def test_busy_cards_timeout(monkeypatch):
+    """nvidia-smi timeout → all cards busy (safe default)."""
     import subprocess as sp
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
     with patch("subprocess.run", side_effect=sp.TimeoutExpired("nvidia-smi", 10)):
-        assert gq.gpu_is_idle() is False
+        assert gq.busy_cards() == {0, 1}
+
+
 
 
 import pytest
@@ -133,10 +147,13 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_queue(tmp_path, monkeypatch):
-    """Redirect QUEUE_DIR/QUEUE_FILE/STATE_FILE to a temp dir for every test."""
+    """Redirect QUEUE_DIR/QUEUE_FILE/STATE_FILE to a temp dir for every test,
+    and reset module-level _running so one test's live jobs can't leak."""
     monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
     monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
     monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_running", {})
+    monkeypatch.setattr(gq, "_shutdown_requested", False)
     yield tmp_path
 
 
@@ -156,10 +173,11 @@ def test_write_then_read_queue():
 
 def test_make_job_fields():
     job = gq._make_job("python train.py", "/home/user/project")
-    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env"}
+    assert set(job.keys()) == {"id", "cmd", "cwd", "added_at", "env", "n"}
     assert job["cmd"] == "python train.py"
     assert job["cwd"] == "/home/user/project"
     assert isinstance(job["env"], dict)
+    assert job["n"] == 1
 
 
 def test_make_job_captures_env(monkeypatch):
@@ -176,14 +194,14 @@ def test_make_job_captures_env(monkeypatch):
 
 def test_read_state_empty():
     state = gq.read_state()
-    assert state == {"daemon_pid": None, "running": None}
+    assert state == {"daemon_pid": None, "running": {}}
 
 
 def test_write_then_read_state():
-    gq.write_state({"daemon_pid": 1234, "running": None})
+    gq.write_state({"daemon_pid": 1234, "running": {}})
     state = gq.read_state()
     assert state["daemon_pid"] == 1234
-    assert state["running"] is None
+    assert state["running"] == {}
 
 
 def test_read_queue_corrupted_resets(tmp_path, monkeypatch):
@@ -196,7 +214,7 @@ def test_read_state_corrupted_resets(tmp_path, monkeypatch):
     monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
     (tmp_path / "state.json").write_text("not json {{{")
     state = gq.read_state()
-    assert state == {"daemon_pid": None, "running": None}
+    assert state == {"daemon_pid": None, "running": {}}
 
 
 def test_read_queue_corrupt_bytes_resets(tmp_path, monkeypatch):
@@ -211,12 +229,32 @@ def test_read_state_non_dict_resets(tmp_path, monkeypatch):
     sf.write_text("null")
     monkeypatch.setattr(gq, "STATE_FILE", sf)
     state = gq.read_state()
-    assert state == {"daemon_pid": None, "running": None}
+    assert state == {"daemon_pid": None, "running": {}}
 
     # also test a list
     sf.write_text("[]")
     state = gq.read_state()
-    assert state == {"daemon_pid": None, "running": None}
+    assert state == {"daemon_pid": None, "running": {}}
+
+
+def test_read_state_migrates_old_single_job_running(tmp_path, monkeypatch):
+    """Old single-job running shape (dict with id/pid, non-dict values) -> {}."""
+    sf = tmp_path / "state.json"
+    sf.write_text(json.dumps({"daemon_pid": 42, "running":
+        {"id": "ab12", "cmd": "x", "pid": 99, "started_at": "t"}}))
+    monkeypatch.setattr(gq, "STATE_FILE", sf)
+    state = gq.read_state()
+    assert state["running"] == {}
+
+
+def test_read_state_preserves_dict_of_jobs(tmp_path, monkeypatch):
+    """New dict-of-jobs running shape is preserved unchanged."""
+    sf = tmp_path / "state.json"
+    jobs = {"ab12": {"id": "ab12", "cmd": "x", "pid": 99, "cards": [0]}}
+    sf.write_text(json.dumps({"daemon_pid": 42, "running": jobs}))
+    monkeypatch.setattr(gq, "STATE_FILE", sf)
+    state = gq.read_state()
+    assert state["running"] == jobs
 
 
 import argparse as ap
@@ -229,7 +267,7 @@ def _args(**kwargs):
 
 def test_cmd_add_appends_to_queue(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo hi"))
+    gq.cmd_add(_args(command="echo hi", gpus=None))
     q = gq.read_queue()
     assert len(q) == 1
     assert q[0]["cmd"] == "echo hi"
@@ -238,7 +276,7 @@ def test_cmd_add_appends_to_queue(tmp_path, monkeypatch):
 
 def test_cmd_add_prints_job_id(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo hi"))
+    gq.cmd_add(_args(command="echo hi", gpus=None))
     out = capsys.readouterr().out
     assert "added job" in out
 
@@ -252,7 +290,7 @@ def test_cmd_list_empty(capsys):
 
 def test_cmd_list_shows_pending(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "python train.py" in out
@@ -260,7 +298,7 @@ def test_cmd_list_shows_pending(tmp_path, monkeypatch, capsys):
 
 def test_cmd_cancel_by_full_id(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo a"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
     job_id = gq.read_queue()[0]["id"]
     gq.cmd_cancel(_args(job_id=job_id))
     assert gq.read_queue() == []
@@ -270,7 +308,7 @@ def test_cmd_cancel_by_full_id(tmp_path, monkeypatch, capsys):
 
 def test_cmd_cancel_by_prefix(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="echo a"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
     job_id = gq.read_queue()[0]["id"]
     gq.cmd_cancel(_args(job_id=job_id[:2]))
     assert gq.read_queue() == []
@@ -284,8 +322,9 @@ def test_cmd_cancel_not_found(capsys):
 
 def test_cmd_cancel_running_job(capsys):
     """Cannot cancel a running job via cancel — redirect user."""
-    gq.write_state({"daemon_pid": None, "running": {"id": "aaaa", "cmd": "x",
-                                                     "pid": 1, "started_at": "t"}})
+    gq.write_state({"daemon_pid": None,
+                    "running": {"aaaa": {"id": "aaaa", "cmd": "x",
+                                         "pid": 1, "started_at": "t"}}})
     gq.cmd_cancel(_args(job_id="aaaa"))
     out = capsys.readouterr().out
     assert "running" in out.lower()
@@ -295,8 +334,8 @@ def test_cmd_cancel_ambiguous_prefix(tmp_path, monkeypatch, capsys):
     """Ambiguous prefix matches multiple pending jobs → message, no removal."""
     monkeypatch.chdir(tmp_path)
     # Add two jobs, then force their IDs to share a 2-char prefix
-    gq.cmd_add(_args(command="echo a"))
-    gq.cmd_add(_args(command="echo b"))
+    gq.cmd_add(_args(command="echo a", gpus=None))
+    gq.cmd_add(_args(command="echo b", gpus=None))
     queue = gq.read_queue()
     queue[0]["id"] = "ab12"
     queue[1]["id"] = "ab34"
@@ -309,8 +348,8 @@ def test_cmd_cancel_ambiguous_prefix(tmp_path, monkeypatch, capsys):
 
 def test_cmd_clear_removes_all(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    gq.cmd_add(_args(command="a"))
-    gq.cmd_add(_args(command="b"))
+    gq.cmd_add(_args(command="a", gpus=None))
+    gq.cmd_add(_args(command="b", gpus=None))
     gq.cmd_clear(_args())
     assert gq.read_queue() == []
     out = capsys.readouterr().out
@@ -319,16 +358,16 @@ def test_cmd_clear_removes_all(tmp_path, monkeypatch, capsys):
 
 def test_cmd_stop_no_running_job(capsys):
     """gq stop with no running job → message, no kill attempted."""
-    gq.write_state({"daemon_pid": None, "running": None})
-    gq.cmd_stop(_args())
+    gq.write_state({"daemon_pid": None, "running": {}})
+    gq.cmd_stop(_args(job_id="zzzz"))
     out = capsys.readouterr().out
-    assert "no job currently running" in out
+    assert "no running job" in out.lower() or "not found" in out.lower()
 
 
 def test_cmd_stop_kills_running_job(monkeypatch, capsys):
     """gq stop SIGKILLs the running job's process group via its pid."""
     gq.write_state({"daemon_pid": None,
-                    "running": {"id": "ab12", "cmd": "x", "pid": 12345}})
+                    "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": 12345}}})
     calls = {"getpgid": None, "killpg": None}
 
     def fake_getpgid(pid):
@@ -340,7 +379,7 @@ def test_cmd_stop_kills_running_job(monkeypatch, capsys):
 
     monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(gq.os, "killpg", fake_killpg)
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
     assert calls["getpgid"] == 12345
     assert calls["killpg"] == (99999, signal.SIGKILL)
@@ -351,7 +390,7 @@ def test_cmd_stop_kills_running_job(monkeypatch, capsys):
 def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
     """If the pid is already gone (ProcessLookupError), report gracefully."""
     gq.write_state({"daemon_pid": None,
-                    "running": {"id": "ab12", "cmd": "x", "pid": 12345}})
+                    "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": 12345}}})
 
     def fake_getpgid(pid):
         raise ProcessLookupError
@@ -359,7 +398,7 @@ def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
     killed = []
     monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
-    gq.cmd_stop(_args())
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
     assert "already finished" in out or "not found" in out
     assert killed == []  # must NOT have called killpg
@@ -368,129 +407,16 @@ def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
 def test_cmd_stop_pid_none_treated_as_no_job(capsys):
     """running entry exists but pid is None (job not fully started) → no job."""
     gq.write_state({"daemon_pid": None,
-                    "running": {"id": "ab12", "cmd": "x", "pid": None}})
-    gq.cmd_stop(_args())
+                    "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": None}}})
+    gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
-    assert "no job currently running" in out
+    assert "no pid" in out.lower() or "not fully started" in out.lower()
 
 
 def test_format_elapsed():
     assert gq._format_elapsed(0) == "00:00:00"
     assert gq._format_elapsed(90) == "00:01:30"
     assert gq._format_elapsed(3661) == "01:01:01"
-
-
-def test_run_job_success(capsys):
-    job = {"id": "test", "cmd": "echo gq_ok", "cwd": "/tmp",
-           "started_at": datetime.datetime.now().isoformat()}
-    exit_code = gq._run_job(job)
-    assert exit_code == 0
-    out = capsys.readouterr().out
-    assert "gq_ok" in out  # echo output passes through
-    assert "DONE" in out
-
-
-def test_run_job_failure(capsys):
-    job = {"id": "fail", "cmd": "false", "cwd": "/tmp",
-           "started_at": datetime.datetime.now().isoformat()}
-    exit_code = gq._run_job(job)
-    assert exit_code != 0
-    out = capsys.readouterr().out
-    assert "FAILED" in out
-
-
-def test_run_job_bad_cwd(capsys):
-    """Job with nonexistent cwd is skipped (exit code -1)."""
-    job = {"id": "badc", "cmd": "echo x", "cwd": "/nonexistent_dir_xyzzy",
-           "started_at": datetime.datetime.now().isoformat()}
-    exit_code = gq._run_job(job)
-    assert exit_code == -1
-    out = capsys.readouterr().out
-    assert "WARNING" in out or "warning" in out.lower()
-
-
-def test_daemon_loop_runs_one_job(tmp_path, monkeypatch, capsys):
-    """Daemon loop picks up a job when GPU is idle, runs it, then stops."""
-    monkeypatch.chdir(tmp_path)
-    # Pre-load queue with one job
-    job = gq._make_job("echo daemon_ran", str(tmp_path))
-    gq.write_queue([job])
-
-    iterations = [0]
-
-    def fake_sleep(n):
-        iterations[0] += 1
-        if iterations[0] > 5:
-            raise KeyboardInterrupt  # stop the loop
-
-    with patch("gq.gpu_is_idle", return_value=True), \
-         patch("time.sleep", side_effect=fake_sleep):
-        try:
-            gq._daemon_loop(poll_interval=1)
-        except KeyboardInterrupt:
-            pass
-
-    out = capsys.readouterr().out
-    assert "daemon_ran" in out
-    assert gq.read_queue() == []  # job was consumed
-
-
-def test_daemon_loop_waits_when_gpu_busy(tmp_path, monkeypatch, capsys):
-    """Daemon does not launch job while GPU is busy."""
-    job = gq._make_job("echo should_not_run", str(tmp_path))
-    gq.write_queue([job])
-
-    iterations = [0]
-
-    def fake_sleep(n):
-        iterations[0] += 1
-        if iterations[0] >= 3:
-            raise KeyboardInterrupt
-
-    with patch("gq.gpu_is_idle", return_value=False), \
-         patch("time.sleep", side_effect=fake_sleep):
-        try:
-            gq._daemon_loop(poll_interval=1)
-        except KeyboardInterrupt:
-            pass
-
-    # Job still in queue — was not consumed
-    assert len(gq.read_queue()) == 1
-
-
-def test_run_job_sets_current_job_pid(tmp_path):
-    """_run_job sets _current_job_pid to the real subprocess pid during execution."""
-    import threading, time as _time
-    gq._current_job_pid = None
-    marker = tmp_path / "started"
-    job = {"id": "pidt", "cmd": f"sh -c 'touch {marker}; sleep 5'",
-           "cwd": str(tmp_path),
-           "started_at": datetime.datetime.now().isoformat()}
-    captured = {}
-
-    def watcher():
-        # wait for the marker file, then snapshot the pid
-        for _ in range(50):
-            if marker.exists():
-                captured["pid"] = gq._current_job_pid
-                break
-            _time.sleep(0.05)
-
-    t = threading.Thread(target=watcher)
-    t.start()
-    # Run job in a thread so we can observe _current_job_pid mid-flight
-    runner = threading.Thread(target=gq._run_job, args=(job,))
-    runner.start()
-    t.join(timeout=3)
-    # force-kill the sleep so runner can finish (don't leave a 5s sleep)
-    if gq._current_job_pid is not None:
-        try:
-            os.killpg(os.getpgid(gq._current_job_pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    runner.join(timeout=5)
-    assert captured.get("pid") is not None, "pid was never set during execution"
-    assert isinstance(captured["pid"], int)
 
 
 def test_force_kill_kills_process_group(tmp_path):
@@ -535,7 +461,7 @@ def test_cmd_add_concurrent_no_lost_jobs(tmp_path, monkeypatch):
 
     def adder(n):
         for i in range(n):
-            gq.cmd_add(ap.Namespace(command=f"echo job{i}"))
+            gq.cmd_add(ap.Namespace(command=f"echo job{i}", gpus=None))
 
     threads = [threading.Thread(target=adder, args=(25,)) for _ in range(4)]
     for t in threads:
@@ -561,9 +487,10 @@ def test_cmd_watch_kills_orphan_on_startup(tmp_path, monkeypatch):
     orphan = sp.Popen("sleep 60", shell=True, start_new_session=True)
     _time.sleep(0.3)
     assert orphan.poll() is None
-    # Pre-seed state as if a previous daemon crashed mid-job
-    gq.write_state({"daemon_pid": None, "running": {"id": "dead",
-                     "cmd": "sleep 60", "pid": orphan.pid, "started_at": "t"}})
+    # Pre-seed state as if a previous daemon crashed mid-job (dict-keyed running)
+    gq.write_state({"daemon_pid": None, "running": {"dead":
+                     {"id": "dead", "cmd": "sleep 60", "pid": orphan.pid,
+                      "started_at": "t"}}})
     # cmd_watch should detect the live orphan, kill it, clear running.
     # Patch _daemon_loop to raise immediately so cmd_watch returns after recovery.
     with patch("gq._daemon_loop", side_effect=KeyboardInterrupt):
@@ -574,7 +501,7 @@ def test_cmd_watch_kills_orphan_on_startup(tmp_path, monkeypatch):
     _time.sleep(0.3)
     assert orphan.poll() is not None, "orphan was not killed by crash recovery"
     state = gq.read_state()
-    assert state["running"] is None
+    assert state["running"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -632,15 +559,14 @@ def test_cmd_watch_finally_clears_daemon_pid(tmp_path, monkeypatch):
     assert gq.read_state()["daemon_pid"] is None
 
 
-def test_run_job_passes_env_to_popen(monkeypatch):
-    """_run_job passes the job's captured env to Popen (full replacement)."""
+def test_launch_job_passes_env_with_cuda(monkeypatch):
+    """_launch_job passes the job's captured env to Popen (full replacement)
+    with CUDA_VISIBLE_DEVICES injected for the assigned cards."""
     captured = {}
 
     class FakeProc:
         def __init__(self, pid):
             self.pid = pid
-        def wait(self):
-            return 0
 
     def fake_popen(cmd, *args, **kwargs):
         captured["kwargs"] = kwargs
@@ -650,19 +576,27 @@ def test_run_job_passes_env_to_popen(monkeypatch):
     job_env = {"PATH": "/fake/bin", "CONDA_DEFAULT_ENV": "myenv", "MY_VAR": "v"}
     job = {"id": "t1", "cmd": "echo hi", "cwd": "/tmp",
            "started_at": datetime.datetime.now().isoformat(), "env": job_env}
-    gq._run_job(job)
-    assert captured["kwargs"]["env"] == job_env
+    proc = gq._launch_job(job, cards=[0, 1])
+    assert proc is not None
+    env = captured["kwargs"]["env"]
+    # Original env preserved, CUDA_VISIBLE_DEVICES added for the assigned cards.
+    for k, v in job_env.items():
+        assert env[k] == v
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
 
 
-def test_run_job_legacy_no_env(monkeypatch):
-    """A job without an env field → Popen called with env=None (inherit daemon env)."""
+def test_launch_job_legacy_no_env_gets_cuda_only(monkeypatch):
+    """A job without an env field → Popen env contains only CUDA_VISIBLE_DEVICES.
+
+    _make_job always captures env now, so this only affects hand-built legacy
+    jobs. _launch_job always injects CUDA_VISIBLE_DEVICES (no escape hatch),
+    so the env is the minimal {CUDA_VISIBLE_DEVICES: ...} rather than None.
+    """
     captured = {}
 
     class FakeProc:
         def __init__(self, pid):
             self.pid = pid
-        def wait(self):
-            return 0
 
     def fake_popen(cmd, *args, **kwargs):
         captured["kwargs"] = kwargs
@@ -671,8 +605,19 @@ def test_run_job_legacy_no_env(monkeypatch):
     monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
     job = {"id": "t2", "cmd": "echo hi", "cwd": "/tmp",
            "started_at": datetime.datetime.now().isoformat()}  # no env key
-    gq._run_job(job)
-    assert captured["kwargs"]["env"] is None
+    proc = gq._launch_job(job, cards=[0])
+    assert proc is not None
+    assert captured["kwargs"]["env"] == {"CUDA_VISIBLE_DEVICES": "0"}
+
+
+def test_launch_job_bad_cwd_returns_none(capsys):
+    """_launch_job with nonexistent cwd returns None (no Popen call)."""
+    job = {"id": "badc", "cmd": "echo x", "cwd": "/nonexistent_dir_xyzzy",
+           "started_at": datetime.datetime.now().isoformat()}
+    proc = gq._launch_job(job, cards=[0])
+    assert proc is None
+    out = capsys.readouterr().out
+    assert "WARNING" in out or "warning" in out.lower()
 
 
 def test_env_name_conda():
@@ -697,7 +642,7 @@ def test_cmd_list_shows_env_name(tmp_path, monkeypatch, capsys):
     """Pending rows show [envname] suffix when the job captured a conda env."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CONDA_DEFAULT_ENV", "myenv")
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "python train.py" in out
@@ -710,7 +655,7 @@ def test_cmd_list_shows_venv_name(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("VIRTUAL_ENV", "/home/u/.venvs/ml")
     # Ensure no conda var is set so venv path wins
     monkeypatch.delenv("CONDA_DEFAULT_ENV", raising=False)
-    gq.cmd_add(_args(command="python train.py"))
+    gq.cmd_add(_args(command="python train.py", gpus=None))
     gq.cmd_list(_args())
     out = capsys.readouterr().out
     assert "[ml]" in out
@@ -737,11 +682,13 @@ def test_cmd_list_shows_env_name_running(tmp_path, monkeypatch, capsys):
     gq.write_state({
         "daemon_pid": None,
         "running": {
-            "id": "r1",
-            "cmd": "python train.py",
-            "cwd": str(tmp_path),
-            "started_at": "2026-07-09T10:00:00",
-            "env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"},
+            "r1": {
+                "id": "r1",
+                "cmd": "python train.py",
+                "cwd": str(tmp_path),
+                "started_at": "2026-07-09T10:00:00",
+                "env": {"CONDA_DEFAULT_ENV": "myenv", "PATH": "/x"},
+            },
         },
     })
     gq.cmd_list(_args())
@@ -751,3 +698,499 @@ def test_cmd_list_shows_env_name_running(tmp_path, monkeypatch, capsys):
     # since no pending jobs exist here).
     assert "python train.py" in out
 
+
+def test_make_job_stores_n():
+    job = gq._make_job("python x.py", "/tmp", n=4)
+    assert job["n"] == 4
+
+
+def test_make_job_default_n():
+    job = gq._make_job("python x.py", "/tmp")
+    assert job["n"] == 1
+
+
+def test_cmd_add_with_gpus(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    gq.cmd_add(_args(command="python train.py", gpus=4))
+    q = gq.read_queue()
+    assert q[0]["n"] == 4
+
+
+def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    # argparse default: gpus=None; cmd_add detects "not explicitly given" via the
+    # None sentinel and prints the single-card notice. We pass gpus=None (the
+    # default) and expect the notice.
+    gq.cmd_add(_args(command="python train.py", gpus=None))
+    out = capsys.readouterr().out
+    assert "single-card" in out.lower() or "no --gpus" in out.lower()
+    assert gq.read_queue()[0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2: busy_cards() / _total_cards() — per-card GPU state primitive
+# ---------------------------------------------------------------------------
+
+def test_busy_cards_my_process():
+    """My compute process on gpu 0 -> {0} busy; other-user proc on gpu 1 ignored."""
+    with patch("subprocess.run", return_value=make_pmon_result(PMON_TWO_CARDS_MY_PROC)), \
+         patch("os.stat") as mock_stat:
+        def fake_stat(path):
+            s = MagicMock()
+            # pid 12345 is mine; 99999 is root; 1255 is mine but type=G
+            s.st_uid = 0 if "99999" in path else os.getuid()
+            return s
+        mock_stat.side_effect = fake_stat
+        assert gq.busy_cards() == {0}
+
+
+def test_busy_cards_none():
+    with patch("subprocess.run", return_value=make_pmon_result(PMON_NO_PROCS)):
+        assert gq.busy_cards() == set()
+
+
+def test_busy_cards_nvidia_smi_failure_all_busy():
+    """nvidia-smi non-zero exit -> empty set (caller treats as 'all busy' via _total_cards diff)."""
+    r = MagicMock(); r.stdout = ""; r.returncode = 1
+    with patch("subprocess.run", return_value=r):
+        # On failure busy_cards returns set() — but the daemon must NOT launch.
+        # The daemon treats len(idle) where idle = total - busy; on failure we
+        # want idle empty. Design: busy_cards returns ALL card indices on failure.
+        # See Step 3: failure returns set(range(total)). For the test, total is
+        # mocked separately; here just assert it does not raise.
+        result = gq.busy_cards()
+        assert isinstance(result, set)
+
+
+
+# ---------------------------------------------------------------------------
+# Task 3: concurrent multi-GPU daemon loop — launch / wait / reap
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Stand-in for subprocess.Popen: supports .pid and .poll()."""
+    def __init__(self, pid, exitcode=None):
+        self.pid = pid
+        self._exitcode = exitcode  # None = still running
+
+    def poll(self):
+        return self._exitcode
+
+
+def test_daemon_launches_when_enough_idle(tmp_path, monkeypatch):
+    """Head needs 2 cards, 3 idle -> launches, assigns 2 cards, records in state."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 4)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())  # all 4 idle
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    launched = {}
+
+    def fake_popen(cmd, *a, **kw):
+        p = _FakeProc(pid=99999)
+        launched["cmd"] = cmd
+        launched["env"] = kw.get("env")
+        return p
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+
+    job = gq._make_job("torchrun --nproc_per_node=2 train.py", str(tmp_path), n=2)
+    gq.write_queue([job])
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    with patch("gq.busy_cards", lambda: set()):
+        try:
+            gq._daemon_loop(poll_interval=1)
+        except KeyboardInterrupt:
+            pass
+
+    state = gq.read_state()
+    assert job["id"] in state["running"]
+    assert state["running"][job["id"]]["cards"] == [0, 1]
+    assert "CUDA_VISIBLE_DEVICES" in launched["env"]
+    assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_daemon_waits_when_not_enough_idle(tmp_path, monkeypatch):
+    """Head needs 2 cards, only 1 idle -> does not launch."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
+    monkeypatch.setattr(gq, "busy_cards", lambda: {0})  # only card 1 idle
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    launched = []
+    monkeypatch.setattr(gq.subprocess, "Popen",
+                        lambda *a, **kw: launched.append(a) or _FakeProc(pid=1))
+
+    job = gq._make_job("x", str(tmp_path), n=2)
+    gq.write_queue([job])
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+    assert launched == []  # never launched
+    assert gq.read_queue()  # job still queued
+
+
+def test_daemon_reaps_finished_job(tmp_path, monkeypatch):
+    """A running job whose poll() returns non-None is reaped and removed from state."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 1)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())
+    proc = _FakeProc(pid=555, exitcode=None)
+    monkeypatch.setattr(gq.subprocess, "Popen", lambda *a, **kw: proc)
+
+    # Pre-seed state as if a job is already running
+    job = gq._make_job("x", str(tmp_path), n=1)
+    job["started_at"] = "2026-07-10T00:00:00"
+    gq.write_state({"daemon_pid": os.getpid(),
+                    "running": {job["id"]: {**job, "cards": [0], "pid": 555}}})
+
+    # Make the proc finish on the second poll
+    calls = [0]
+
+    def fake_poll():
+        calls[0] += 1
+        return 0 if calls[0] >= 2 else None
+
+    proc.poll = fake_poll
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 4:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    # Pre-seed the module-level _running so the daemon adopts the live proc.
+    # The loop must NOT reset _running on entry (it only resets _shutdown_requested).
+    monkeypatch.setattr(gq, "_running",
+                        {job["id"]: {"proc": proc, "job": job, "cards": [0], "start": 0.0}})
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+    state = gq.read_state()
+    assert job["id"] not in state["running"]  # reaped
+
+
+def test_graceful_shutdown_drains_running_and_skips_launch(tmp_path, monkeypatch):
+    """First Ctrl-C requests graceful shutdown: the loop must keep reaping the
+    live job until it finishes (NOT exit immediately) and must NOT launch the
+    queued head after shutdown is requested."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 2)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    launched = []
+    monkeypatch.setattr(gq.subprocess, "Popen",
+                        lambda *a, **kw: launched.append(a) or _FakeProc(pid=777))
+
+    # A pre-seeded running job + a queued head that must NOT launch post-shutdown.
+    running_job = gq._make_job("running", str(tmp_path), n=1)
+    running_job["started_at"] = "2026-07-10T00:00:00"
+    queued_job = gq._make_job("queued", str(tmp_path), n=1)
+    gq.write_queue([queued_job])
+    gq.write_state({"daemon_pid": os.getpid(),
+                    "running": {running_job["id"]:
+                                {**running_job, "cards": [0], "pid": 555}}})
+
+    proc = _FakeProc(pid=555, exitcode=None)
+    poll_calls = [0]
+
+    def fake_poll():
+        poll_calls[0] += 1
+        if poll_calls[0] == 1:
+            # First Ctrl-C lands during the first reap: request graceful
+            # shutdown while the job is still running (poll() -> None).
+            gq._shutdown_requested = True
+            return None
+        return 0  # finished on the second reap
+
+    proc.poll = fake_poll
+
+    # Pre-seed the module-level _running so the daemon adopts the live proc.
+    monkeypatch.setattr(gq, "_running",
+                        {running_job["id"]: {"proc": proc, "job": running_job,
+                                             "cards": [0], "start": 0.0}})
+
+    # Safety valve: if the loop fails to drain and exit, force exit.
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 5:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    # The queued head was NOT launched: launch block is gated after shutdown.
+    assert launched == []
+    # The running job WAS reaped before exit (loop drained instead of bailing).
+    assert gq._running == {}
+    state = gq.read_state()
+    assert state["running"] == {}
+    # The queued job is still queued (not launched, not dropped).
+    assert [j["id"] for j in gq.read_queue()] == [queued_job["id"]]
+
+
+def test_daemon_launches_multiple_jobs_per_cycle_disjoint_cards(tmp_path, monkeypatch):
+    """Two n=2 jobs queued on a 4-card box, all idle (busy_cards=set() to
+    simulate nvidia-smi lag). The launch loop must start BOTH in one cycle on
+    DISJOINT card sets — the `idle = idle - set(cards)` reservation is the ONLY
+    thing preventing a collision here. This test fails if that reservation line
+    is removed."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 4)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())  # all idle, smi lag
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+    pids = iter(range(1000, 9999))
+    launched = []
+
+    def fake_popen(cmd, *a, **kw):
+        p = _FakeProc(pid=next(pids))
+        launched.append({"cmd": cmd, "env": kw.get("env"), "pid": p.pid})
+        return p
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+
+    job_a = gq._make_job("trainA", str(tmp_path), n=2)
+    job_b = gq._make_job("trainB", str(tmp_path), n=2)
+    gq.write_queue([job_a, job_b])
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    # Both jobs launched in the single cycle.
+    assert len(launched) == 2, f"expected 2 launches, got {len(launched)}"
+    # Both recorded in _running / state.
+    state = gq.read_state()
+    assert job_a["id"] in state["running"]
+    assert job_b["id"] in state["running"]
+    cards_a = set(state["running"][job_a["id"]]["cards"])
+    cards_b = set(state["running"][job_b["id"]]["cards"])
+    # Disjoint card sets whose union is all 4 cards.
+    assert cards_a.isdisjoint(cards_b), f"card collision: {cards_a} & {cards_b}"
+    assert cards_a | cards_b == {0, 1, 2, 3}
+    # Each got exactly 2 cards.
+    assert len(cards_a) == 2 and len(cards_b) == 2
+    # The queue is drained (both popped in one cycle).
+    assert gq.read_queue() == []
+
+
+def test_daemon_reap_frees_cards_then_launches_next(tmp_path, monkeypatch):
+    """Cycle 1: job A (n=2 on cards {0,1}) is pre-seeded running and finishes
+    (poll->0); reap frees {0,1}; the launch block then starts queued job B
+    (n=2) on the now-free cards. Verifies reap runs before launch in the cycle
+    and that freed cards are reusable."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(gq, "_total_cards", lambda: 4)
+    monkeypatch.setattr(gq, "busy_cards", lambda: set())
+    monkeypatch.setattr(gq, "_pick_idle", lambda idle, n: sorted(idle)[:n])
+
+    # Job A pre-seeded as running; its proc finishes immediately (poll -> 0).
+    job_a = gq._make_job("runA", str(tmp_path), n=2)
+    job_a["started_at"] = "2026-07-10T00:00:00"
+    proc_a = _FakeProc(pid=555, exitcode=0)
+    monkeypatch.setattr(gq, "_running",
+                        {job_a["id"]: {"proc": proc_a, "job": job_a,
+                                       "cards": [0, 1], "start": 0.0}})
+    gq.write_state({"daemon_pid": os.getpid(),
+                    "running": {job_a["id"]:
+                                {**job_a, "cards": [0, 1], "pid": 555}}})
+
+    # Job B queued, needs 2 cards.
+    job_b = gq._make_job("runB", str(tmp_path), n=2)
+    gq.write_queue([job_b])
+
+    launched = []
+
+    def fake_popen(cmd, *a, **kw):
+        p = _FakeProc(pid=777)
+        launched.append({"env": kw.get("env")})
+        return p
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+
+    iterations = [0]
+
+    def fake_sleep(n):
+        iterations[0] += 1
+        if iterations[0] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(gq.time, "sleep", fake_sleep)
+
+    try:
+        gq._daemon_loop(poll_interval=1)
+    except KeyboardInterrupt:
+        pass
+
+    state = gq.read_state()
+    # Job A reaped (removed from running + state).
+    assert job_a["id"] not in state["running"]
+    assert job_a["id"] not in gq._running
+    # Job B launched in the same cycle, got 2 cards (the freed {0,1}).
+    assert job_b["id"] in state["running"]
+    assert len(launched) == 1
+    cards_b = state["running"][job_b["id"]]["cards"]
+    assert len(cards_b) == 2
+    assert set(cards_b) == {0, 1}
+
+
+def test_pick_idle_returns_lowest_n():
+    assert gq._pick_idle({3, 1, 4, 1, 5}, 2) == [1, 3]
+    assert gq._pick_idle(set(), 1) == []
+    assert gq._pick_idle({0, 2}, 5) == [0, 2]
+
+
+def test_second_ctrl_c_kills_all_running(tmp_path, monkeypatch):
+    """The second-Ctrl-C path SIGKILLs every running job's process group."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append(pgid))
+    # Two fake running jobs in _running
+    p1 = _FakeProc(pid=100)
+    p2 = _FakeProc(pid=200)
+    monkeypatch.setattr(gq, "_running", {
+        "a": {"proc": p1, "job": {"id": "a"}, "cards": [0], "start": 0.0},
+        "b": {"proc": p2, "job": {"id": "b"}, "cards": [1], "start": 0.0},
+    })
+    # Invoke the second-Ctrl-C kill-all path directly (the handler is a closure
+    # inside _daemon_loop, so we test the extracted helper it delegates to).
+    gq._force_kill_all_running()
+    # Both process groups were SIGKILLed.
+    assert sorted(killed) == [100, 200]
+
+
+# ---------------------------------------------------------------------------
+# Task 4: cmd_stop <id>, cmd_list cards column, multi-orphan crash recovery
+# ---------------------------------------------------------------------------
+
+def test_cmd_stop_requires_id(capsys):
+    """gq stop with no matching id -> error, no kill."""
+    gq.write_state({"daemon_pid": None, "running": {}})
+    gq.cmd_stop(_args(job_id="zzzz"))
+    out = capsys.readouterr().out
+    assert "no running job" in out.lower() or "not found" in out.lower()
+
+
+def test_cmd_stop_stops_named_job(monkeypatch, capsys):
+    """With two running jobs, gq stop <id> kills only the named one."""
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1},
+        "cd34": {"id": "cd34", "cmd": "y", "pid": 222, "cards": [1], "n": 1},
+    }})
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", lambda pid: pid * 10)
+    monkeypatch.setattr(gq.os, "killpg",
+                        lambda pgid, sig: killed.append(pgid))
+    gq.cmd_stop(_args(job_id="ab12"))
+    out = capsys.readouterr().out
+    assert "stopped job ab12" in out
+    assert killed == [1110]  # only ab12's group (111*10), not cd34's
+
+
+def test_cmd_stop_unknown_id(capsys):
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1}}})
+    gq.cmd_stop(_args(job_id="zz99"))
+    out = capsys.readouterr().out
+    assert "not found" in out.lower() or "no running job" in out.lower()
+
+
+def test_cmd_list_shows_cards(tmp_path, monkeypatch, capsys):
+    """Running jobs show their assigned GPU cards."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_state({"daemon_pid": None, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun train.py", "cwd": str(tmp_path),
+                 "pid": 111, "cards": [0, 1], "n": 2,
+                 "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                 "env": {}}}})
+    gq.cmd_list(_args())
+    out = capsys.readouterr().out
+    assert "GPU 0,1" in out or "0,1" in out
+    assert "torchrun train.py" in out
+
+
+def test_cmd_watch_crash_recovery_multiple_orphans(monkeypatch, capsys, tmp_path):
+    """Startup clears multiple orphaned running entries."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    # Two running entries: one alive, one dead
+    gq.write_state({"daemon_pid": 99999, "running": {
+        "ab12": {"id": "ab12", "cmd": "x", "pid": 111, "cards": [0], "n": 1},
+        "cd34": {"id": "cd34", "cmd": "y", "pid": 222, "cards": [1], "n": 1}}})
+    # pid 111 alive, pid 222 dead
+    def fake_getpgid(pid):
+        if pid == 222:
+            raise ProcessLookupError
+        return pid
+    killed = []
+    monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append(pgid))
+    # os.kill for daemon-pid check: daemon 99999 dead
+    monkeypatch.setattr(gq.os, "kill",
+                        lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError)
+                        if pid == 99999 else None)
+    # Stop the loop immediately
+    monkeypatch.setattr(gq, "_daemon_loop",
+                        lambda poll: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        gq.cmd_watch(_args(poll=1))
+    except KeyboardInterrupt:
+        pass
+    assert 111 in killed or 1110 in killed  # the alive orphan's group was killed
+    state = gq.read_state()
+    assert state["running"] == {}  # all cleared

@@ -20,15 +20,37 @@ QUEUE_FILE = QUEUE_DIR / "queue.json"
 STATE_FILE = QUEUE_DIR / "state.json"
 
 
-def gpu_is_idle() -> bool:
-    """Return True if no compute (type=C) process owned by the current user is on the GPU.
+_TOTAL_CARDS = None  # type: Optional[int]
 
-    Only Compute-context processes (CUDA workloads, e.g. python training jobs) count
-    as "GPU busy". Graphics processes (type=G: Xorg, gnome-shell, chrome, VS Code, ...)
-    are the desktop environment and are always present — they must NOT block the queue,
-    or the GPU would never be reported idle.
+
+def _total_cards() -> int:
+    """Count GPUs via nvidia-smi -L. Cached after first call."""
+    global _TOTAL_CARDS
+    if _TOTAL_CARDS is not None:
+        return _TOTAL_CARDS
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True, text=True, timeout=10
+        )
+        # Each GPU is one line: "GPU 0: NVIDIA GeForce ..."
+        _TOTAL_CARDS = sum(1 for line in result.stdout.splitlines()
+                           if line.startswith("GPU "))
+        if _TOTAL_CARDS == 0:
+            _TOTAL_CARDS = 1  # fallback so idle math doesn't divide weirdly
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _TOTAL_CARDS = 1
+    return _TOTAL_CARDS
+
+
+def busy_cards() -> set:
+    """Return the set of physical GPU indices with a compute (type=C) process
+    owned by the current user. Graphics (type=G) and other users' processes
+    do not count. On nvidia-smi failure/timeout, returns ALL card indices
+    (safe default: daemon treats all as busy -> no launch).
     """
     uid = os.getuid()
+    total = _total_cards()
     try:
         result = subprocess.run(
             ["nvidia-smi", "pmon", "-s", "um", "-c", "1"],
@@ -39,31 +61,37 @@ def gpu_is_idle() -> bool:
               file=sys.stderr)
         sys.exit(1)
     except subprocess.TimeoutExpired:
-        print("[gq] WARNING: nvidia-smi timed out, treating GPU as busy.",
+        print("[gq] WARNING: nvidia-smi timed out, treating all GPUs as busy.",
               file=sys.stderr)
-        return False
+        return set(range(total))
 
     if result.returncode != 0:
         print(f"[gq] WARNING: nvidia-smi failed (exit {result.returncode}), "
-              "treating GPU as busy.", file=sys.stderr)
-        return False
+              "treating all GPUs as busy.", file=sys.stderr)
+        return set(range(total))
 
+    busy = set()
     for line in result.stdout.splitlines():
         if line.startswith("#") or not line.strip():
             continue
         parts = line.split()
-        # pmon columns: gpu  pid  type  ...  command  (type at index 2)
         if len(parts) < 3:
             continue
-        if parts[2] != "C":          # skip Graphics (G) — desktop environment
+        if parts[2] != "C":          # skip Graphics (G)
             continue
         try:
+            gpu = int(parts[0])
             pid = int(parts[1])
             if os.stat(f"/proc/{pid}").st_uid == uid:
-                return False
+                busy.add(gpu)
         except (ValueError, FileNotFoundError, PermissionError):
             continue
-    return True
+    return busy
+
+
+def _pick_idle(idle: set, n: int) -> list:
+    """Pick n idle card indices (lowest indices first)."""
+    return sorted(idle)[:n]
 
 
 def _lock_and_read(path: Path, default):
@@ -139,11 +167,22 @@ def write_queue(jobs: list) -> None:
 
 
 def read_state() -> dict:
-    default = {"daemon_pid": None, "running": None}
+    default = {"daemon_pid": None, "running": {}}
     state = _lock_and_read(STATE_FILE, default)
     if not isinstance(state, dict):
         print("[gq] WARNING: state.json corrupted (non-object), resetting.", file=sys.stderr)
         return dict(default)
+    running = state.get("running")
+    # New shape: running is a dict keyed by job id (possibly empty).
+    # Old shape: running was None or a single job dict with "id"/"pid". Migrate
+    # those to {} so the dict-keyed model never sees a stale single-job entry.
+    # Heuristic: a single-job dict has "id" and "pid" keys whose values are NOT
+    # dicts; a dict-of-jobs has dict values (or is empty).
+    if running is None or (isinstance(running, dict) and "id" in running and "pid" in running
+                           and not any(isinstance(v, dict) for v in running.values())):
+        state["running"] = {}
+    elif not isinstance(running, dict):
+        state["running"] = {}
     # Ensure required keys exist even if file had partial data
     return {**default, **state}
 
@@ -152,7 +191,7 @@ def write_state(state: dict) -> None:
     _lock_and_write(STATE_FILE, state)
 
 
-def _make_job(cmd: str, cwd: str) -> dict:
+def _make_job(cmd: str, cwd: str, n: int = 1) -> dict:
     return {
         "id": secrets.token_hex(2),
         "cmd": cmd,
@@ -163,13 +202,17 @@ def _make_job(cmd: str, cwd: str) -> dict:
         # the entire dict must be stored (conda/venv activation rewrites PATH and
         # sets many CONDA_* / VIRTUAL_ENV vars that a cherry-pick would drop).
         "env": dict(os.environ),
+        "n": n,
     }
 
 
 def cmd_add(args) -> None:
-    job = _make_job(args.command, os.getcwd())
+    n = args.gpus if args.gpus is not None else 1
+    job = _make_job(args.command, os.getcwd(), n=n)
     with _locked_queue() as q:
         q.append(job)
+    if args.gpus is None:
+        print(f"[gq] no --gpus given, running as single-card job")
     print(f"[gq] added job {job['id']}: {args.command}")
 
 
@@ -194,19 +237,21 @@ def cmd_list(args) -> None:
     state = read_state()
     queue = read_queue()
 
-    # Running job
-    if state.get("running"):
-        r = state["running"]
-        try:
-            started = datetime.datetime.fromisoformat(r["started_at"])
-            elapsed = datetime.datetime.now() - started
-            elapsed_str = str(elapsed).split(".")[0]  # drop microseconds
-        except (KeyError, ValueError, TypeError):
-            elapsed_str = "unknown"
+    # Running jobs (now potentially multiple)
+    running = state.get("running") or {}
+    if running:
         print("[gq] running:")
-        ename = _env_name(r)
-        suffix = f"  [{ename}]" if ename else ""
-        print(f"  {r['id']}  {r['cmd']}   started {elapsed_str} ago{suffix}")
+        for rid, r in running.items():
+            try:
+                started = datetime.datetime.fromisoformat(r["started_at"])
+                elapsed = str(datetime.datetime.now() - started).split(".")[0]
+            except (KeyError, ValueError, TypeError):
+                elapsed = "unknown"
+            cards = ",".join(str(c) for c in r.get("cards", []))
+            ename = _env_name(r)
+            suffix = f"  [{ename}]" if ename else ""
+            gpu = f"  GPU {cards}" if cards else ""
+            print(f"  {rid}  {r['cmd']}{gpu}   started {elapsed} ago{suffix}")
     else:
         print("[gq] running: none")
 
@@ -236,11 +281,14 @@ def cmd_list(args) -> None:
 def cmd_cancel(args) -> None:
     job_id = args.job_id
 
-    # Check if it's the running job (read_state uses its own lock — do NOT
-    # hold the queue lock while checking state).
+    # Check if it's a running job (read_state uses its own lock — do NOT
+    # hold the queue lock while checking state). running is a dict keyed by
+    # job id; refuse to cancel any job that is currently running.
     state = read_state()
-    if state.get("running") and state["running"]["id"].startswith(job_id):
-        print(f"[gq] job {state['running']['id']} is currently running. "
+    running = state.get("running") or {}
+    match = next((rid for rid in running if rid.startswith(job_id)), None)
+    if match:
+        print(f"[gq] job {match} is currently running. "
               "Use 'gq stop' to stop it (the daemon stays alive).")
         return
 
@@ -269,34 +317,39 @@ def cmd_clear(args) -> None:
 
 
 def cmd_stop(args) -> None:
-    """Stop the currently-running job (SIGKILL its process group).
+    """Stop a specific running job by ID (SIGKILL its process group).
 
-    Reads state.running.pid and kills the whole process group — the same
-    operation crash-recovery uses on daemon restart. The daemon is NOT
-    signaled: it is blocked in proc.wait(), which returns when the job is
-    killed, then it clears running and continues to the next queued job.
-    Run from any window; no need to switch to the daemon terminal.
+    With multiple jobs running concurrently, an ID is required. The daemon
+    stays alive and reaps the killed job, releasing its cards.
     """
     state = read_state()
-    running = state.get("running")
-    rpid = running.get("pid") if running else None
+    running = state.get("running") or {}
+    job_id = args.job_id
 
-    if not rpid:
-        print("[gq] no job currently running.")
+    matches = [jid for jid in running if jid.startswith(job_id)]
+    if not matches:
+        print(f"[gq] no running job matches '{job_id}'.")
+        return
+    if len(matches) > 1:
+        ids = ", ".join(matches)
+        print(f"[gq] ambiguous prefix '{job_id}' matches: {ids}. Be more specific.")
         return
 
+    target_id = matches[0]
+    rpid = running[target_id].get("pid")
+    if not rpid:
+        print(f"[gq] job {target_id} has no pid yet (not fully started).")
+        return
     try:
         pgid = os.getpgid(rpid)
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
-        print(f"[gq] job {running.get('id')} already finished "
-              f"(pid {rpid} not found).")
+        print(f"[gq] job {target_id} already finished (pid {rpid} not found).")
         return
     except PermissionError as exc:
-        print(f"[gq] ERROR: cannot stop job {running.get('id')} "
-              f"(pid {rpid}): {exc}")
+        print(f"[gq] ERROR: cannot stop job {target_id} (pid {rpid}): {exc}")
         return
-    print(f"[gq] stopped job {running.get('id')} (pid {rpid}).")
+    print(f"[gq] stopped job {target_id} (pid {rpid}).")
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -305,63 +358,53 @@ def _format_elapsed(seconds: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
-def _run_job(job: dict) -> int:
+def _launch_job(job: dict, cards: list) -> Optional[subprocess.Popen]:
+    """Launch a job on the given cards (non-blocking). Returns the Popen, or
+    None on launch failure. Injects CUDA_VISIBLE_DEVICES into the job's env.
     """
-    Run a single job synchronously. stdout/stderr pass through to terminal.
-    Returns exit code, or -1 if cwd is missing or launch fails.
-
-    Uses Popen with start_new_session=True so the shell+command form their own
-    process group; the real subprocess pid is published to _current_job_pid so
-    the SIGINT handler can force-kill the whole group on a second Ctrl-C.
-    """
-    global _current_job_pid
     cwd = job["cwd"]
     if not os.path.isdir(cwd):
         print(f"[gq] WARNING: cwd '{cwd}' does not exist, skipping job {job['id']}.")
-        return -1
-
-    start = time.monotonic()
-    print(f"[gq] >>> {job['cmd']}")
+        return None
+    env = dict(job.get("env") or {})
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(c) for c in cards)
+    print(f"[gq] >>> {job['cmd']}   (GPU {','.join(str(c) for c in cards)})")
     try:
         proc = subprocess.Popen(job["cmd"], shell=True, cwd=cwd,
-                                start_new_session=True,
-                                env=job.get("env"))
+                                start_new_session=True, env=env)
     except Exception as exc:
         print(f"[gq] ERROR running job {job['id']}: {exc}")
-        return -1
-
-    _current_job_pid = proc.pid
-    # Record the real subprocess pid in state.running so that crash-recovery
-    # (cmd_watch) can find and kill the orphan if this daemon is killed mid-job.
-    try:
-        _state = read_state()
-        if _state.get("running") and _state["running"].get("id") == job["id"]:
-            _state["running"]["pid"] = proc.pid
-            write_state(_state)
-    except Exception:
-        pass  # best-effort; never let state update break job execution
-
-    try:
-        code = proc.wait()
-    finally:
-        _current_job_pid = None
-
-    elapsed = _format_elapsed(time.monotonic() - start)
-    if code == 0:
-        print(f"[gq] <<< job {job['id']} DONE (exit=0) in {elapsed}")
-    else:
-        print(f"[gq] <<< job {job['id']} FAILED (exit={code}) in {elapsed}")
-    return code
+        return None
+    return proc
 
 
-# Module-level flag so signal handler can communicate with the loop
+# Module-level state for the concurrent loop. _shutdown_requested lets the
+# SIGINT handler ask the loop to stop; _running holds live jobs so the handler
+# can force-kill ALL of them on a second Ctrl-C. _running is module-level so it
+# persists across loop iterations (the loop does NOT reset it on entry).
 _shutdown_requested = False
-_current_job_pid = None  # type: Optional[int]
+_running = {}  # type: dict  # {id: {"proc": Popen, "job": dict, "cards": [int], "start": float}}
+
+
+def _force_kill_all_running() -> None:
+    """SIGKILL every running job's process group (the second-Ctrl-C path).
+
+    shell=True spawns /bin/sh -c <cmd>, so killing only the shell pid would
+    orphan the real command; SIGKILL each group via os.killpg. Extracted to a
+    module-level helper so it is unit-testable without delivering real signals.
+    """
+    for rid, info in list(_running.items()):
+        pid = info["proc"].pid
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def _daemon_loop(poll_interval: int) -> None:
-    """Main daemon polling loop. Runs until KeyboardInterrupt or _shutdown_requested."""
-    global _shutdown_requested, _current_job_pid
+    """Concurrent multi-GPU polling loop. Launches the queue head when enough
+    idle cards exist; reaps finished jobs each cycle. Exits on shutdown."""
+    global _shutdown_requested
     _shutdown_requested = False
 
     ctrl_c_count = [0]
@@ -369,61 +412,87 @@ def _daemon_loop(poll_interval: int) -> None:
     def _handle_sigint(sig, frame):
         ctrl_c_count[0] += 1
         if ctrl_c_count[0] == 1:
-            print("\n[gq] Ctrl-C received. Waiting for current job to finish. "
-                  "Press Ctrl-C again to force-kill.", file=sys.stderr)
-            _shutdown_requested = True  # will exit after current job
+            print("\n[gq] Ctrl-C received. Waiting for running jobs to finish. "
+                  "Press Ctrl-C again to force-kill all.", file=sys.stderr)
+            _shutdown_requested = True
         else:
-            # Second Ctrl-C: force-kill the whole process group. shell=True
-            # spawns /bin/sh -c <cmd>, so killing only the shell pid would
-            # orphan the real command; SIGKILL the group via os.killpg instead.
-            pid = _current_job_pid
-            if pid is not None:
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            # Second Ctrl-C: SIGKILL ALL running jobs' process groups.
+            _force_kill_all_running()
             sys.exit(0)
 
     old_handler = signal.signal(signal.SIGINT, _handle_sigint)
     try:
-        while not _shutdown_requested:
-            state = read_state()
+        # Keep looping while not shutting down OR there are still live jobs to
+        # reap. After the first Ctrl-C sets _shutdown_requested, the loop drains
+        # _running (reaping finished jobs) but does NOT launch new ones — the
+        # launch block below is gated on `not _shutdown_requested`. Only when
+        # every live job has been reaped does the loop exit, so graceful Ctrl-C
+        # no longer orphans jobs that are still running on the GPU.
+        while not _shutdown_requested or _running:
+            # 1. Reap finished jobs (always, even after shutdown requested).
+            for rid in list(_running.keys()):
+                info = _running[rid]
+                code = info["proc"].poll()
+                if code is not None:
+                    elapsed = _format_elapsed(time.monotonic() - info["start"])
+                    if code == 0:
+                        print(f"[gq] <<< job {rid} DONE (exit=0) in {elapsed}")
+                    else:
+                        print(f"[gq] <<< job {rid} FAILED (exit={code}) in {elapsed}")
+                    del _running[rid]
+                    _state = read_state()
+                    _state.setdefault("running", {}).pop(rid, None)
+                    write_state(_state)
 
-            # Skip if a job is actively tracked (shouldn't happen in synchronous mode,
-            # but guards against stale state)
-            if state.get("running"):
-                time.sleep(poll_interval)
-                continue
+            # 2. Launch as many queued jobs as fit the idle cards this cycle
+            # (NOT just the head) so concurrent multi-GPU jobs start together
+            # instead of being staggered by poll_interval seconds each. After
+            # graceful shutdown is requested, skip launching so no new jobs
+            # start while we drain the live ones.
+            if not _shutdown_requested:
+                total = _total_cards()
+                busy = busy_cards()
+                # Cards already assigned to running jobs are not idle even if
+                # nvidia-smi hasn't caught up.
+                assigned = set()
+                for info in _running.values():
+                    assigned.update(info["cards"])
+                idle = set(range(total)) - busy - assigned
 
-            if not gpu_is_idle():
-                time.sleep(poll_interval)
-                continue
+                # Launch in a loop: re-derive idle (subtracting each just-launched
+                # job's cards) so the next job gets DIFFERENT cards. Strict FIFO:
+                # if the head doesn't fit, break — don't skip to smaller jobs.
+                while True:
+                    with _locked_queue() as q:
+                        if not q:
+                            break
+                        head = q[0]
+                        n = head.get("n", 1)
+                        if len(idle) < n:
+                            break  # head doesn't fit; don't skip (strict FIFO)
+                        q.pop(0)
+                    cards = _pick_idle(idle, n)
+                    proc = _launch_job(head, cards)
+                    if proc is not None:
+                        head["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                        _running[head["id"]] = {"proc": proc, "job": head,
+                                                "cards": cards, "start": time.monotonic()}
+                        _state = read_state()
+                        _state.setdefault("running", {})[head["id"]] = {
+                            **head, "cards": cards, "pid": proc.pid
+                        }
+                        write_state(_state)
+                        print(f"\n[gq] GPU idle — starting job {head['id']} on "
+                              f"GPU {','.join(str(c) for c in cards)}")
+                        # Reserve these cards so the next iteration picks
+                        # different ones.
+                        idle = idle - set(cards)
+                    else:
+                        # launch failed (bad cwd) — job already popped; don't
+                        # loop forever trying to re-launch it.
+                        break
 
-            # Pop a job atomically: hold the lock across the RMW so a
-            # concurrent cmd_add cannot be lost.
-            job = None
-            with _locked_queue() as q:
-                if q:
-                    job = q.pop(0)
-            if job is None:
-                time.sleep(poll_interval)
-                continue
-
-            job["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            # pid placeholder; _run_job fills in the real subprocess pid once
-            # Popen starts, so crash-recovery (cmd_watch) can find/kill it.
-            write_state({
-                "daemon_pid": os.getpid(),
-                "running": {**job, "pid": None},
-            })
-
-            print(f"\n[gq] GPU idle — starting job {job['id']}")
-            _run_job(job)  # blocks until done
-
-            write_state({"daemon_pid": os.getpid(), "running": None})
-
-            if _shutdown_requested:
-                break
+            time.sleep(poll_interval)
     finally:
         signal.signal(signal.SIGINT, old_handler)
 
@@ -442,36 +511,37 @@ def cmd_watch(args) -> None:
         except ProcessLookupError:
             pass  # stale pid — proceed
 
-    # Clear stale running entry on startup (crash recovery). If the recorded
-    # pid is still alive, the previous daemon was killed mid-job and the
-    # orphan is still on the GPU — kill its process group, then clear.
-    running = state.get("running")
+    # Clear stale running entries on startup (crash recovery). running is now a
+    # dict keyed by job id; for each entry, if the recorded pid is still alive
+    # the previous daemon was killed mid-job and the orphan is still on the GPU
+    # — kill its process group. Stale (dead) entries are just cleared.
+    running = state.get("running") or {}
     if running:
-        rpid = running.get("pid")
-        alive = False
-        if rpid:
-            try:
-                # Job runs in its own session/group (start_new_session=True),
-                # so getpgid(rpid) == rpid. Check liveness via the group.
-                os.killpg(os.getpgid(rpid), 0)
-                alive = True
-            except ProcessLookupError:
-                pass
-            except (TypeError, PermissionError):
-                pass  # pid None/non-int or not ours — treat as stale
-        if not alive:
-            print(f"[gq] WARNING: stale running entry for job {running.get('id')} "
-                  "cleared (process no longer running).", file=sys.stderr)
-            state["running"] = None
-        else:
-            print(f"[gq] WARNING: orphaned job {running.get('id')} (pid {rpid}) still "
-                  "running from a previous daemon crash; killing its process group.",
-                  file=sys.stderr)
-            try:
-                os.killpg(os.getpgid(rpid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            state["running"] = None
+        for rid, r in list(running.items()):
+            rpid = r.get("pid")
+            alive = False
+            if rpid:
+                try:
+                    # Job runs in its own session/group (start_new_session=True),
+                    # so getpgid(rpid) == rpid. Check liveness via the group.
+                    os.killpg(os.getpgid(rpid), 0)
+                    alive = True
+                except ProcessLookupError:
+                    pass
+                except (TypeError, PermissionError):
+                    pass  # pid None/non-int or not ours — treat as stale
+            if alive:
+                print(f"[gq] WARNING: orphaned job {rid} (pid {rpid}) still running "
+                      "from a previous daemon crash; killing its process group.",
+                      file=sys.stderr)
+                try:
+                    os.killpg(os.getpgid(rpid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                print(f"[gq] WARNING: stale running entry for job {rid} "
+                      "cleared (process no longer running).", file=sys.stderr)
+        state["running"] = {}
 
     # Register this daemon
     state["daemon_pid"] = os.getpid()
@@ -483,11 +553,17 @@ def cmd_watch(args) -> None:
     try:
         _daemon_loop(args.poll)
     finally:
-        # Clean up daemon_pid on exit, and clear any running entry left by a
-        # force-kill mid-job (graceful exits already set running=None).
+        # Clear only the daemon_pid. Do NOT blanket-clear state["running"]:
+        # on a graceful exit the loop has already drained _running to empty
+        # (each reaped job is popped from state["running"] as it finishes), so
+        # state["running"] is already {}. On a force-kill (2nd Ctrl-C),
+        # _force_kill_all_running SIGKILLed the process groups but they may
+        # not have been reaped yet — leaving state["running"] lets the next
+        # `gq watch` reap them via crash-recovery (live orphans are killed,
+        # dead entries are cleared as stale). Clearing here would orphan jobs
+        # that are still alive on the GPU.
         s = read_state()
         s["daemon_pid"] = None
-        s["running"] = None
         write_state(s)
 
 
@@ -504,6 +580,8 @@ def main():
 
     p_add = sub.add_parser("add", help="Add a command to the queue")
     p_add.add_argument("command", help="Shell command to run")
+    p_add.add_argument("--gpus", type=int, default=None,
+                       help="Number of GPUs the job needs (default: 1, single-card)")
 
     sub.add_parser("list", help="Show queue and current status")
 
@@ -512,7 +590,8 @@ def main():
 
     sub.add_parser("clear", help="Clear all pending jobs")
 
-    sub.add_parser("stop", help="Stop the currently-running job")
+    p_stop = sub.add_parser("stop", help="Stop a running job by ID")
+    p_stop.add_argument("job_id", help="Job ID or unique prefix")
 
     args = parser.parse_args()
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
