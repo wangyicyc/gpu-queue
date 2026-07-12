@@ -199,6 +199,7 @@ gq add --gpus 1 'python eval.py'
 
 - `queue.json` —— 待跑任务列表
 - `state.json` —— daemon PID + 当前运行任务
+- `logs/` —— 每个任务的 stdout/stderr 日志（`<id>.log`）
 
 两个文件都受 `fcntl.flock` 保护，CLI 和 daemon 同时读写不会写坏。文件损坏会自动重置并告警，不会崩溃。
 
@@ -218,6 +219,17 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 > 需要 bash-completion（大多数发行版默认装了）。补全脚本在仓库的 `completions/gq.bash`，clone 后即可用。
 >
 > **`gq add` 补全文件名时不带引号。** bash 不会在单引号内部触发补全，所以 `gq add 'python eval<Tab>'` 补不出来。简单命令直接不引号：`gq add python eval<Tab>` → `eval.py`。带多参数的命令需要引号时，先把文件名补全再套引号：`gq add train<Tab>` → 改成 `gq add 'python train.py --seed 1'`。
+
+### TUI 可视化面板（可选）
+
+直接敲 `gq`（不带子命令）进入一个全屏 TUI 面板，像 htop/ranger 那样用上下方向键选择操作、回车执行，不用打命令名：
+
+- **Add job** → 弹出一个真正的 bash（可以 cd、tab 补全、试跑命令），把要排队的命令打出来后按 **F5** 提交（不执行该命令），再选 `--gpus` 卡数入队。
+- **Stop: <id>** / **Cancel: #<n> <id>** → 选中回车，确认后停/取消该任务。
+- **Clear queue** / **Quit** → 回车执行。
+- **Open log: <id>** → 查看该任务的输出日志尾部。
+
+面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。`gq watch` 仍是起 daemon 的命令（在 tmux 里常驻），任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
 
 ### 测试
 
@@ -433,6 +445,17 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 >
 > **For `gq add` filename completion, don't use quotes.** bash doesn't trigger completion inside single quotes, so `gq add 'python eval<Tab>'` won't complete. For simple commands, skip the quotes: `gq add python eval<Tab>` → `eval.py`. For commands with multiple arguments that need quotes, complete the filename first then wrap: `gq add train<Tab>` → edit to `gq add 'python train.py --seed 1'`.
 
+### TUI panel (optional)
+
+Typing bare `gq` (no subcommand) opens a full-screen TUI — htop/ranger-style: arrow keys to select an operation, Enter to run it, no command typing.
+
+- **Add job** → spawns a real bash (you can cd, tab-complete, test-run), type the command to queue, press **F5** to submit it (without executing), then pick `--gpus`.
+- **Stop: <id>** / **Cancel: #<n> <id>** → select, Enter, confirm.
+- **Clear queue** / **Quit** → Enter.
+- **Open log: <id>** → view that job's log tail.
+
+The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. `gq watch` still starts the daemon (in tmux); task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
+
 ### Tests
 
 ```bash
@@ -442,7 +465,7 @@ python -m pytest tests/ -v    # 71 tests
 ### Limitations
 
 - Multi-GPU parallelism: `gq` assigns jobs by card count and can run several jobs in parallel across multiple cards at once. No multi-user fair scheduling, no clustering (that's Slurm's job).
-- Job output streams to the daemon's foreground terminal — no separate log files (by design; use tmux's scrollback buffer).
+- Job output streams to the daemon's foreground terminal and to `~/.gpu-queue/logs/<id>.log` (TUI/CLI view via Open log).
 
 ### License
 
