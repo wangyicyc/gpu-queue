@@ -1375,3 +1375,31 @@ def test_run_bash_for_command_reads_temp_files(tmp_path, monkeypatch):
     assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
     assert result["cwd"] == "/home/walle/proj"
     assert result["env"]["MY"] == "1"
+
+
+def test_tui_do_action_quit_returns_true(monkeypatch):
+    """The quit action signals the TUI to exit."""
+    # _tui_do_action with a quit row returns True (done).
+    done = gq._tui_do_action.__wrapped__ if hasattr(gq._tui_do_action, "__wrapped__") else None
+    # Call the underlying logic: we test via a thin pure helper _dispatch_action.
+    assert gq._dispatch_action({"action": "quit", "job_id": None}) is True
+
+
+def test_tui_do_action_cancel_writes_queue(monkeypatch, tmp_path):
+    """The cancel action removes the job from the queue (via cmd_cancel logic)."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_queue([{"id": "ef56", "cmd": "x", "cwd": str(tmp_path), "n": 1, "env": {}}])
+    gq._dispatch_action({"action": "cancel", "job_id": "ef56"})
+    assert gq.read_queue() == []
+
+
+def test_tui_do_action_clear_empties_queue(monkeypatch, tmp_path):
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_queue([{"id": "a", "cmd": "x", "cwd": str(tmp_path), "n": 1, "env": {}},
+                    {"id": "b", "cmd": "y", "cwd": str(tmp_path), "n": 1, "env": {}}])
+    gq._dispatch_action({"action": "clear", "job_id": None})
+    assert gq.read_queue() == []

@@ -805,13 +805,117 @@ def _render_panel(stdscr, rows, focus, gpu_summary):
     stdscr.noutrefresh()
 
 
-def _tui_do_action(stdscr, row) -> bool:
-    """Dispatch the focused row's action. STUB for Task 3 — Task 5 fills this in.
-
-    Returns True if the TUI should exit, False to continue. Until Task 5,
-    Enter is a no-op (returns False) so the TUI never crashes on selection.
+def _dispatch_action(row: dict) -> bool:
+    """Pure dispatch for a TUI row's action (no curses). Returns True if the
+    TUI should quit. add/open_log/stop are handled by the curses-aware
+    _tui_do_action (they need stdscr or subprocess); _dispatch_action handles
+    the state-only ones (quit/cancel/clear) for testability.
     """
+    action = row["action"]
+    if action == "quit":
+        return True
+    if action == "cancel":
+        # Reuse cmd_cancel's logic by constructing an args-like namespace.
+        cmd_cancel(argparse.Namespace(job_id=row["job_id"]))
+        return False
+    if action == "clear":
+        cmd_clear(argparse.Namespace())
+        return False
+    # add, stop, open_log are curses/subprocess-bound — handled in _tui_do_action
     return False
+
+
+def _tui_confirm(stdscr, msg):
+    """y/n confirm. Returns True on y."""
+    h, w = stdscr.getmaxyx()
+    stdscr.addstr(h - 2, 0, (" " * (w - 1)))
+    stdscr.addstr(h - 2, 0, f" {msg} [y/n] "[:w - 1], curses.A_BOLD)
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), 27):  # n or Esc
+            return False
+
+
+def _tui_select_gpus(stdscr):
+    """Curses list-select for --gpus in 1..N. Returns the selected int, or 1."""
+    n = _total_cards()
+    choices = list(range(1, n + 1))
+    focus = 0
+    h, w = stdscr.getmaxyx()
+    while True:
+        stdscr.addstr(h - 2, 0, " " * (w - 1))
+        line = " --gpus: " + "  ".join(f"[{c}]" if i == focus else f" {c} "
+                                       for i, c in enumerate(choices))
+        stdscr.addstr(h - 2, 0, line[:w - 1], curses.A_BOLD)
+        ch = stdscr.getch()
+        if ch in (curses.KEY_LEFT, ord("h")):
+            focus = max(0, focus - 1)
+        elif ch in (curses.KEY_RIGHT, ord("l")):
+            focus = min(len(choices) - 1, focus + 1)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            return choices[focus]
+        elif ch == 27:
+            return 1  # default on Esc
+
+
+def _tui_do_action(stdscr, row) -> bool:
+    """Execute a TUI row's action. Returns True if TUI should quit."""
+    action = row["action"]
+    if action == "quit":
+        return True
+    if action == "add":
+        captured = _run_bash_for_command()
+        if not captured:
+            return False  # user cancelled in bash
+        n = _tui_select_gpus(stdscr)
+        job = _make_job(captured["cmd"], captured["cwd"], n=n)
+        # Use the bash-captured env instead of the snapshot (bash may have
+        # activated a conda env during composition). Strip READLINE_LINE /
+        # READLINE_POINT first — these are set transiently by bash's `bind -x`
+        # during F5 capture and must not leak into the job's stored environment.
+        env = {k: v for k, v in captured["env"].items()
+               if k not in ("READLINE_LINE", "READLINE_POINT")}
+        job["env"] = env
+        with _locked_queue() as q:
+            q.append(job)
+        return False
+    if action == "stop":
+        if _tui_confirm(stdscr, f"Stop {row['job_id']}?"):
+            cmd_stop(argparse.Namespace(job_id=row["job_id"]))
+        return False
+    if action == "cancel":
+        if _tui_confirm(stdscr, f"Cancel {row['job_id']}?"):
+            _dispatch_action(row)
+        return False
+    if action == "clear":
+        if _tui_confirm(stdscr, "Clear all queued jobs?"):
+            _dispatch_action(row)
+        return False
+    if action == "open_log":
+        log_path = LOG_DIR / f"{row['job_id']}.log"
+        _tui_show_log(stdscr, log_path)
+        return False
+    return False
+
+
+def _tui_show_log(stdscr, log_path):
+    """Show the tail of a job's log file; any key returns."""
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError:
+        text = "(no log yet)"
+    lines = text.splitlines()[-(h - 2):]
+    stdscr.addstr(0, 0, f" log: {log_path}"[:w - 1], curses.A_BOLD)
+    for i, ln in enumerate(lines, 1):
+        if i >= h - 1:
+            break
+        stdscr.addstr(i, 0, ln[:w - 1])
+    stdscr.addstr(h - 1, 0, " any key to return "[:w - 1], curses.color_pair(4))
+    stdscr.getch()
 
 
 def _tui_main(stdscr):
