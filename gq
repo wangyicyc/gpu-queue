@@ -843,11 +843,21 @@ def _tui_restore_halfdelay(stdscr):
     curses.halfdelay(20)
 
 
-def _tui_confirm(stdscr, msg):
-    """y/n confirm. Returns True on y."""
+def _tui_confirm(stdscr, focus_y, label, msg):
+    """y/n confirm drawn INLINE on the focused row, right after its label —
+    so the prompt sits next to the operation the user selected, not stranded
+    at the screen bottom. Returns True on y.
+    """
     h, w = stdscr.getmaxyx()
-    stdscr.addstr(h - 2, 0, (" " * (w - 1)))
-    stdscr.addstr(h - 2, 0, f" {msg} [y/n] "[:w - 1], curses.A_BOLD)
+    if not (0 <= focus_y < h):
+        focus_y = h - 2  # fallback to near-bottom if the row is off-screen
+    # Clear from end of label to end of line, then write the prompt inline.
+    x = min(len(label) + 1, w - 1)
+    _safe_addstr(stdscr, focus_y, x, " " * (w - 1 - x))
+    prompt = f"  {msg} [y/n]"
+    _safe_addstr(stdscr, focus_y, x, prompt[:w - 1 - x],
+                 curses.A_REVERSE | curses.A_BOLD)
+    stdscr.refresh()
     _tui_blocking_mode(stdscr)
     try:
         while True:
@@ -886,11 +896,19 @@ def _tui_select_gpus(stdscr):
         _tui_restore_halfdelay(stdscr)
 
 
-def _tui_do_action(stdscr, row) -> bool:
-    """Execute a TUI row's action. Returns True if TUI should quit."""
+def _tui_do_action(stdscr, row, focus) -> bool:
+    """Execute a TUI row's action. Returns True if TUI should quit.
+
+    `focus` is the index of the selected row in the operations list; it's
+    used to compute the screen y where inline confirm prompts are drawn.
+    """
     action = row["action"]
     if action == "quit":
         return True
+    # Screen y of the focused operations-list row: 1 (top status) + N GPU
+    # bars + 1 separator + focus. Used to draw confirm prompts inline.
+    focus_y = 1 + _total_cards() + 1 + focus
+    label = row.get("label", "")
     if action == "add":
         captured = _run_bash_for_command()
         if not captured:
@@ -908,15 +926,15 @@ def _tui_do_action(stdscr, row) -> bool:
             q.append(job)
         return False
     if action == "stop":
-        if _tui_confirm(stdscr, f"Stop {row['job_id']}?"):
+        if _tui_confirm(stdscr, focus_y, label, f"Stop {row['job_id']}?"):
             cmd_stop(argparse.Namespace(job_id=row["job_id"]))
         return False
     if action == "cancel":
-        if _tui_confirm(stdscr, f"Cancel {row['job_id']}?"):
+        if _tui_confirm(stdscr, focus_y, label, f"Cancel {row['job_id']}?"):
             _dispatch_action(row)
         return False
     if action == "clear":
-        if _tui_confirm(stdscr, "Clear all queued jobs?"):
+        if _tui_confirm(stdscr, focus_y, label, "Clear all queued jobs?"):
             _dispatch_action(row)
         return False
     if action == "open_log":
@@ -971,7 +989,7 @@ def _tui_main(stdscr):
             break
         elif ch in (curses.KEY_ENTER, 10, 13):
             if rows and 0 <= focus < len(rows):
-                done = _tui_do_action(stdscr, rows[focus])
+                done = _tui_do_action(stdscr, rows[focus], focus)
                 if done:
                     break
         # any other key / timeout: just re-render on next cycle
