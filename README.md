@@ -239,12 +239,12 @@ cd gpu-queue
 python -m pytest tests/ -v
 ```
 
-71 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复。
+87 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复、多卡调度、TUI 逻辑。
 
 ### 限制
 
 - 多卡并行：gq 按卡数自动分配，一次可在多张卡上并行跑多个任务。不支持多用户公平调度、集群（那是 Slurm 的活）
-- 任务会以前台方式打到 daemon 终端，没有独立日志文件（设计如此，用 tmux 的滚动缓冲即可）
+- 任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要，TUI 里 Open log 可查看）
 
 ### 许可证
 
@@ -459,7 +459,7 @@ The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no
 ### Tests
 
 ```bash
-python -m pytest tests/ -v    # 71 tests
+python -m pytest tests/ -v    # 87 tests
 ```
 
 ### Limitations
