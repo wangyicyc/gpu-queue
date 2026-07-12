@@ -216,6 +216,8 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 ```
 
 > 需要 bash-completion（大多数发行版默认装了）。补全脚本在仓库的 `completions/gq.bash`，clone 后即可用。
+>
+> **`gq add` 补全文件名时不带引号。** bash 不会在单引号内部触发补全，所以 `gq add 'python eval<Tab>'` 补不出来。简单命令直接不引号：`gq add python eval<Tab>` → `eval.py`。带多参数的命令需要引号时，先把文件名补全再套引号：`gq add train<Tab>` → 改成 `gq add 'python train.py --seed 1'`。
 
 ### 测试
 
@@ -428,6 +430,8 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 ```
 
 > Requires bash-completion (installed by default on most distros). The completion script lives at `completions/gq.bash` in the repo — usable after `git clone`.
+>
+> **For `gq add` filename completion, don't use quotes.** bash doesn't trigger completion inside single quotes, so `gq add 'python eval<Tab>'` won't complete. For simple commands, skip the quotes: `gq add python eval<Tab>` → `eval.py`. For commands with multiple arguments that need quotes, complete the filename first then wrap: `gq add train<Tab>` → edit to `gq add 'python train.py --seed 1'`.
 
 ### Tests
 
