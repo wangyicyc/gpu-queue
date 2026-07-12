@@ -11,6 +11,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -840,6 +841,102 @@ def _tui_main(stdscr):
                 if done:
                     break
         # any other key / timeout: just re-render on next cycle
+
+
+def _run_bash_for_command():
+    """Spawn an interactive bash for the user to compose/test a command. F5
+    grabs the current readline line (without executing it) plus cwd + env,
+    then exits bash. Returns {"cmd","cwd","env"} on F5, or None if the user
+    quits bash (Ctrl-D) without pressing F5.
+
+    Mechanism: write a small bash init script (rcfile) that defines a
+    `__gq_capture` function (which dumps $READLINE_LINE, $PWD, and `env -0`
+    to temp files then `exit 0`) and binds F5 (\\e[15~) to call it. The
+    function is used because `bind -x` command strings cannot contain real
+    quote delimiters around $READLINE_LINE (an inline `\"$READLINE_LINE\"`
+    leaves the variable unquoted at execution, word-splitting spaces out of
+    the command). The rcfile is passed as `--rcfile` so bash sources it at
+    interactive startup and the bind takes effect. After bash exits we read
+    the temp files back and parse them.
+
+    FALLBACK: if F5/bind proves unreliable on a terminal, replace this with
+    a curses single-line input box (no cd/tab/test-run) returning the same dict.
+    """
+    cmd_fd, cmd_path = tempfile.mkstemp(prefix="gq_cmd_")
+    cwd_fd, cwd_path = tempfile.mkstemp(prefix="gq_cwd_")
+    env_fd, env_path = tempfile.mkstemp(prefix="gq_env_")
+    for fd in (cmd_fd, cwd_fd, env_fd):
+        os.close(fd)
+
+    init_script = (
+        "__gq_capture() {\n"
+        f"  printf '%s' \"$READLINE_LINE\" > {cmd_path}\n"
+        f"  pwd > {cwd_path}\n"
+        f"  env -0 > {env_path}\n"
+        "  exit 0\n"
+        "}\n"
+        'bind -x \'"\\e[15~": "__gq_capture"\'\n'
+        'echo "[gq] compose your command, then press F5 to submit to the queue (Ctrl-D to cancel)."\n'
+    )
+    # Write the init script to a temp rcfile and pass it as `--rcfile` so bash
+    # sources it at interactive startup and the F5 bind takes effect. Uses
+    # NamedTemporaryFile (not mkstemp) so it doesn't consume one of the
+    # cmd/cwd/env temp-file slots the caller manages.
+    with tempfile.NamedTemporaryFile(
+        mode="w", prefix="gq_rc_", suffix=".sh", delete=False
+    ) as rc:
+        rc.write(init_script)
+        rc_path = rc.name
+
+    try:
+        proc = subprocess.Popen(
+            ["bash", "--rcfile", rc_path, "-i"],
+            stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"[gq] ERROR spawning bash: {exc}", file=sys.stderr)
+        for p in (cmd_path, cwd_path, env_path, rc_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+    proc.wait()
+
+    try:
+        os.unlink(rc_path)
+    except OSError:
+        pass
+
+    cmd = Path(cmd_path).read_text()
+    if not cmd:
+        # user quit bash (Ctrl-D) without pressing F5
+        for p in (cmd_path, cwd_path, env_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+    cwd = Path(cwd_path).read_text().strip()
+    env = {}
+    raw = Path(env_path).read_bytes()
+    # `env -0` writes null-separated entries; fall back to newline splitting
+    # for callers/tests that write newline-separated env files. Prefer null
+    # splitting when present so multi-line values survive intact.
+    entries = raw.split(b"\x00") if b"\x00" in raw else raw.split(b"\n")
+    for entry in entries:
+        if b"=" in entry:
+            k, _, v = entry.partition(b"=")
+            try:
+                env[k.decode()] = v.decode()
+            except UnicodeDecodeError:
+                continue
+    for p in (cmd_path, cwd_path, env_path):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    return {"cmd": cmd, "cwd": cwd, "env": env}
 
 
 def main():

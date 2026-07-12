@@ -1334,3 +1334,44 @@ def test_gpu_utilization_missing_binary_returns_empty(monkeypatch):
 
     monkeypatch.setattr(gq.subprocess, "run", boom)
     assert gq._gpu_utilization() == {}
+
+
+def test_run_bash_for_command_reads_temp_files(tmp_path, monkeypatch):
+    """_run_bash_for_command spawns bash; on 'F5', reads cmd/cwd/env from temp files."""
+    # Simulate bash writing the temp files then exiting (the bind's effect),
+    # without actually running an interactive bash.
+    cmd_file = tmp_path / "cmd"
+    cwd_file = tmp_path / "cwd"
+    env_file = tmp_path / "env"
+    cmd_file.write_text("torchrun --nproc_per_node=4 train.py")
+    cwd_file.write_text("/home/walle/proj")
+    env_file.write_text("PATH=/x\nCUDA_VISIBLE_DEVICES=\nMY=1\n")
+
+    def fake_popen(bash_cmd, **kwargs):
+        # The real impl writes a script that bash runs; here simulate the bind
+        # having fired by returning a proc that immediately exits 0.
+        class P:
+            pid = 555
+            def wait(self):
+                return 0
+        return P()
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    # Point the impl's temp-file names at our fakes by monkeypatching tempfile
+    import tempfile
+    real_mkstemp = tempfile.mkstemp
+    seq = {"n": 0}
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        # Return our pre-filled files in order: cmd, cwd, env
+        f = [cmd_file, cwd_file, env_file][seq["n"] - 1]
+        import os as _os
+        fd = _os.open(str(f), _os.O_RDONLY)
+        return fd, str(f)
+    monkeypatch.setattr(gq.tempfile, "mkstemp", fake_mkstemp)
+
+    result = gq._run_bash_for_command()
+    assert result is not None
+    assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
+    assert result["cwd"] == "/home/walle/proj"
+    assert result["env"]["MY"] == "1"
