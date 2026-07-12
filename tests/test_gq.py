@@ -728,6 +728,42 @@ def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, c
 
 
 # ---------------------------------------------------------------------------
+# Task 2: TUI state-to-rows logic (_build_rows)
+# ---------------------------------------------------------------------------
+
+def test_build_rows_empty():
+    """No running, no queued: only static ops (Add, Clear, Quit)."""
+    rows = gq._build_rows({"daemon_pid": None, "running": {}}, [])
+    actions = [r["action"] for r in rows]
+    assert actions == ["add", "clear", "quit"]
+
+
+def test_build_rows_with_running_and_queued():
+    state = {"daemon_pid": 1, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun x", "cards": [0, 1], "pid": 9,
+                 "started_at": "2026-07-11T10:00:00", "n": 2, "env": {}}}}
+    queue = [{"id": "ef56", "cmd": "python eval.py", "n": 1, "env": {}}]
+    rows = gq._build_rows(state, queue)
+    actions = [r["action"] for r in rows]
+    # Add first, then Stop per running job, Open log per running job,
+    # Cancel per queued job, Clear, Quit.
+    assert actions == ["add", "stop", "open_log", "cancel", "clear", "quit"]
+    stop_row = next(r for r in rows if r["action"] == "stop")
+    assert stop_row["job_id"] == "ab12"
+    cancel_row = next(r for r in rows if r["action"] == "cancel")
+    assert cancel_row["job_id"] == "ef56"
+
+
+def test_build_rows_labels_contain_ids():
+    state = {"daemon_pid": 1, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun x", "cards": [0], "pid": 9,
+                 "started_at": "2026-07-11T10:00:00", "n": 1, "env": {}}}}
+    rows = gq._build_rows(state, [])
+    labels = " ".join(r["label"] for r in rows)
+    assert "ab12" in labels  # the running job id appears in Stop/Open-log labels
+
+
+# ---------------------------------------------------------------------------
 # Task 2: busy_cards() / _total_cards() — per-card GPU state primitive
 # ---------------------------------------------------------------------------
 
@@ -1194,3 +1230,191 @@ def test_cmd_watch_crash_recovery_multiple_orphans(monkeypatch, capsys, tmp_path
     assert 111 in killed or 1110 in killed  # the alive orphan's group was killed
     state = gq.read_state()
     assert state["running"] == {}  # all cleared
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (TUI foundation): per-job log redirection in _launch_job
+# ---------------------------------------------------------------------------
+
+def test_launch_job_redirects_to_log_file(tmp_path, monkeypatch):
+    """_launch_job opens ~/.gpu-queue/logs/<id>.log and passes it as stdout/stderr."""
+    monkeypatch.setattr(gq, "LOG_DIR", tmp_path / "logs")
+    captured = {}
+
+    class FakeProc:
+        pid = 12345
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["stdout"] = kwargs.get("stdout")
+        captured["stderr"] = kwargs.get("stderr")
+        captured["env_CVD"] = (kwargs.get("env") or {}).get("CUDA_VISIBLE_DEVICES")
+        return FakeProc()
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job = {"id": "ab12", "cmd": "echo hi", "cwd": str(tmp_path), "env": {}}
+    proc = gq._launch_job(job, [0])
+    assert proc is not None
+    # stdout/stderr were file objects opened on LOG_DIR/<id>.log
+    assert captured["stdout"] is not None
+    assert captured["stderr"] is captured["stdout"]  # same file, two streams
+    log_path = tmp_path / "logs" / "ab12.log"
+    assert captured["stdout"].name == str(log_path)
+    assert captured["env_CVD"] == "0"
+
+
+def test_launch_job_log_dir_created(tmp_path, monkeypatch):
+    """LOG_DIR is created if it doesn't exist."""
+    monkeypatch.setattr(gq, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(gq.subprocess, "Popen",
+                        lambda *a, **kw: type("P", (), {"pid": 1})())
+    gq._launch_job({"id": "x1", "cmd": "echo", "cwd": str(tmp_path), "env": {}}, [0])
+    assert (tmp_path / "logs").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (TUI): curses shell smoke test + _gpu_utilization helper
+# ---------------------------------------------------------------------------
+
+def test_tui_main_importable():
+    """_tui_main and _render_panel exist and are callable (curses itself is manual)."""
+    assert callable(gq._tui_main)
+    assert callable(gq._render_panel)
+    assert callable(gq._gpu_summary_line)
+
+
+def test_util_bar_width_and_chars():
+    """_util_bar is always exactly `width` chars, only block chars."""
+    bar = gq._util_bar(67, 12)
+    assert len(bar) == 12
+    assert set(bar) <= set("█▏▎▍▌▋▊▉░")
+    # 0% -> all empty, 100% -> all full
+    assert gq._util_bar(0, 12) == "░" * 12
+    assert gq._util_bar(100, 12) == "█" * 12
+    # 50% -> half full / half empty
+    assert gq._util_bar(50, 12) == "█" * 6 + "░" * 6
+
+
+def test_gpu_utilization_parses_nvidia_smi(monkeypatch):
+    """_gpu_utilization returns {gpu_index: percent} from nvidia-smi output."""
+    class FakeResult:
+        returncode = 0
+        stdout = "67\n12\n0\n"
+
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["nvidia-smi", "--query-gpu=utilization.gpu",
+                       "--format=csv,noheader,nounits"]
+        return FakeResult()
+
+    monkeypatch.setattr(gq.subprocess, "run", fake_run)
+    utils = gq._gpu_utilization()
+    assert utils == {0: 67, 1: 12, 2: 0}
+
+
+def test_gpu_utilization_failure_returns_empty(monkeypatch):
+    """On nvidia-smi failure (nonzero exit), returns {} so callers degrade."""
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(gq.subprocess, "run",
+                        lambda *a, **kw: FakeResult())
+    assert gq._gpu_utilization() == {}
+
+
+def test_gpu_utilization_missing_binary_returns_empty(monkeypatch):
+    """If nvidia-smi isn't installed (FileNotFoundError), returns {}."""
+    def boom(*a, **kw):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(gq.subprocess, "run", boom)
+    assert gq._gpu_utilization() == {}
+
+
+def test_run_bash_for_command_reads_temp_files(tmp_path, monkeypatch):
+    """_run_bash_for_command spawns bash; on 'F5', reads cmd/cwd/env from temp files."""
+    # Simulate bash writing the temp files then exiting (the bind's effect),
+    # without actually running an interactive bash.
+    cmd_file = tmp_path / "cmd"
+    cwd_file = tmp_path / "cwd"
+    env_file = tmp_path / "env"
+    cmd_file.write_text("torchrun --nproc_per_node=4 train.py")
+    cwd_file.write_text("/home/walle/proj")
+    env_file.write_text("PATH=/x\nCUDA_VISIBLE_DEVICES=\nMY=1\n")
+
+    def fake_popen(bash_cmd, **kwargs):
+        # The real impl writes a script that bash runs; here simulate the bind
+        # having fired by returning a proc that immediately exits 0.
+        class P:
+            pid = 555
+            def wait(self):
+                return 0
+        return P()
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    # Point the impl's temp-file names at our fakes by monkeypatching tempfile
+    import tempfile
+    real_mkstemp = tempfile.mkstemp
+    seq = {"n": 0}
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        # Return our pre-filled files in order: cmd, cwd, env
+        f = [cmd_file, cwd_file, env_file][seq["n"] - 1]
+        import os as _os
+        fd = _os.open(str(f), _os.O_RDONLY)
+        return fd, str(f)
+    monkeypatch.setattr(gq.tempfile, "mkstemp", fake_mkstemp)
+
+    result = gq._run_bash_for_command()
+    assert result is not None
+    assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
+    assert result["cwd"] == "/home/walle/proj"
+    assert result["env"]["MY"] == "1"
+
+
+def test_tui_do_action_quit_returns_true(monkeypatch):
+    """The quit action signals the TUI to exit."""
+    # _tui_do_action with a quit row returns True (done).
+    done = gq._tui_do_action.__wrapped__ if hasattr(gq._tui_do_action, "__wrapped__") else None
+    # Call the underlying logic: we test via a thin pure helper _dispatch_action.
+    assert gq._dispatch_action({"action": "quit", "job_id": None}) is True
+
+
+def test_tui_do_action_cancel_writes_queue(monkeypatch, tmp_path):
+    """The cancel action removes the job from the queue (via cmd_cancel logic)."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_queue([{"id": "ef56", "cmd": "x", "cwd": str(tmp_path), "n": 1, "env": {}}])
+    gq._dispatch_action({"action": "cancel", "job_id": "ef56"})
+    assert gq.read_queue() == []
+
+
+def test_tui_do_action_clear_empties_queue(monkeypatch, tmp_path):
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    gq.write_queue([{"id": "a", "cmd": "x", "cwd": str(tmp_path), "n": 1, "env": {}},
+                    {"id": "b", "cmd": "y", "cwd": str(tmp_path), "n": 1, "env": {}}])
+    gq._dispatch_action({"action": "clear", "job_id": None})
+    assert gq.read_queue() == []
+
+
+def test_main_no_arg_runs_tui(monkeypatch):
+    """gq with no subcommand enters the TUI (curses.wrapper)."""
+    called = {"tui": False}
+    def fake_wrapper(fn):
+        called["tui"] = True
+        # don't actually run curses
+    monkeypatch.setattr(gq.curses, "wrapper", fake_wrapper)
+    monkeypatch.setattr(sys, "argv", ["gq"])
+    gq.main()
+    assert called["tui"] is True
+
+
+def test_main_subcommand_still_works(monkeypatch, tmp_path):
+    """gq list (with subcommand) still dispatches to cmd_list, not TUI."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sys, "argv", ["gq", "list"])
+    gq.main()  # should not raise / not enter TUI
