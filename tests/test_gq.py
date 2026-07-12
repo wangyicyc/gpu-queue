@@ -1194,3 +1194,42 @@ def test_cmd_watch_crash_recovery_multiple_orphans(monkeypatch, capsys, tmp_path
     assert 111 in killed or 1110 in killed  # the alive orphan's group was killed
     state = gq.read_state()
     assert state["running"] == {}  # all cleared
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (TUI foundation): per-job log redirection in _launch_job
+# ---------------------------------------------------------------------------
+
+def test_launch_job_redirects_to_log_file(tmp_path, monkeypatch):
+    """_launch_job opens ~/.gpu-queue/logs/<id>.log and passes it as stdout/stderr."""
+    monkeypatch.setattr(gq, "LOG_DIR", tmp_path / "logs")
+    captured = {}
+
+    class FakeProc:
+        pid = 12345
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["stdout"] = kwargs.get("stdout")
+        captured["stderr"] = kwargs.get("stderr")
+        captured["env_CVD"] = (kwargs.get("env") or {}).get("CUDA_VISIBLE_DEVICES")
+        return FakeProc()
+
+    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
+    job = {"id": "ab12", "cmd": "echo hi", "cwd": str(tmp_path), "env": {}}
+    proc = gq._launch_job(job, [0])
+    assert proc is not None
+    # stdout/stderr were file objects opened on LOG_DIR/<id>.log
+    assert captured["stdout"] is not None
+    assert captured["stderr"] is captured["stdout"]  # same file, two streams
+    log_path = tmp_path / "logs" / "ab12.log"
+    assert captured["stdout"].name == str(log_path)
+    assert captured["env_CVD"] == "0"
+
+
+def test_launch_job_log_dir_created(tmp_path, monkeypatch):
+    """LOG_DIR is created if it doesn't exist."""
+    monkeypatch.setattr(gq, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(gq.subprocess, "Popen",
+                        lambda *a, **kw: type("P", (), {"pid": 1})())
+    gq._launch_job({"id": "x1", "cmd": "echo", "cwd": str(tmp_path), "env": {}}, [0])
+    assert (tmp_path / "logs").is_dir()

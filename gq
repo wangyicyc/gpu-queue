@@ -18,6 +18,7 @@ from typing import Optional
 QUEUE_DIR = Path.home() / ".gpu-queue"
 QUEUE_FILE = QUEUE_DIR / "queue.json"
 STATE_FILE = QUEUE_DIR / "state.json"
+LOG_DIR = QUEUE_DIR / "logs"
 
 
 _TOTAL_CARDS = None  # type: Optional[int]
@@ -361,6 +362,8 @@ def _format_elapsed(seconds: float) -> str:
 def _launch_job(job: dict, cards: list) -> Optional[subprocess.Popen]:
     """Launch a job on the given cards (non-blocking). Returns the Popen, or
     None on launch failure. Injects CUDA_VISIBLE_DEVICES into the job's env.
+    Task stdout/stderr is redirected to ~/.gpu-queue/logs/<id>.log (the watch
+    terminal prints only summary lines; the TUI can display the log tail).
     """
     cwd = job["cwd"]
     if not os.path.isdir(cwd):
@@ -368,13 +371,27 @@ def _launch_job(job: dict, cards: list) -> Optional[subprocess.Popen]:
         return None
     env = dict(job.get("env") or {})
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(c) for c in cards)
-    print(f"[gq] >>> {job['cmd']}   (GPU {','.join(str(c) for c in cards)})")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{job['id']}.log"
+    try:
+        log_f = open(log_path, "w")
+    except OSError as exc:
+        print(f"[gq] ERROR opening log {log_path}: {exc}")
+        return None
+    print(f"[gq] >>> {job['cmd']}   (GPU {','.join(str(c) for c in cards)})   log: {log_path}")
     try:
         proc = subprocess.Popen(job["cmd"], shell=True, cwd=cwd,
-                                start_new_session=True, env=env)
+                                start_new_session=True, env=env,
+                                stdout=log_f, stderr=log_f)
     except Exception as exc:
+        log_f.close()
         print(f"[gq] ERROR running job {job['id']}: {exc}")
         return None
+    # Popen sets self.stdout = None when stdout is a file (not PIPE), so retain
+    # the handle ourselves for the daemon to flush/close when the job is reaped
+    # (see _daemon_loop reap block). NOTE: log_f is intentionally not closed
+    # here — the child writes to its fd asynchronously.
+    proc.stdout = log_f
     return proc
 
 
@@ -439,6 +456,11 @@ def _daemon_loop(poll_interval: int) -> None:
                         print(f"[gq] <<< job {rid} DONE (exit=0) in {elapsed}")
                     else:
                         print(f"[gq] <<< job {rid} FAILED (exit={code}) in {elapsed}")
+                    # Flush/close the per-job log file (retained on proc.stdout by
+                    # _launch_job). Guarded: legacy/fake procs may lack stdout.
+                    _logf = getattr(info["proc"], "stdout", None)
+                    if _logf is not None:
+                        _logf.close()
                     del _running[rid]
                     _state = read_state()
                     _state.setdefault("running", {}).pop(rid, None)
