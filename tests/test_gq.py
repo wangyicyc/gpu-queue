@@ -1397,3 +1397,24 @@ def test_tui_do_action_clear_empties_queue(monkeypatch, tmp_path):
                     {"id": "b", "cmd": "y", "cwd": str(tmp_path), "n": 1, "env": {}}])
     gq._dispatch_action({"action": "clear", "job_id": None})
     assert gq.read_queue() == []
+
+
+def test_main_no_arg_runs_tui(monkeypatch):
+    """gq with no subcommand enters the TUI (curses.wrapper)."""
+    called = {"tui": False}
+    def fake_wrapper(fn):
+        called["tui"] = True
+        # don't actually run curses
+    monkeypatch.setattr(gq.curses, "wrapper", fake_wrapper)
+    monkeypatch.setattr(sys, "argv", ["gq"])
+    gq.main()
+    assert called["tui"] is True
+
+
+def test_main_subcommand_still_works(monkeypatch, tmp_path):
+    """gq list (with subcommand) still dispatches to cmd_list, not TUI."""
+    monkeypatch.setattr(gq, "QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(gq, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sys, "argv", ["gq", "list"])
+    gq.main()  # should not raise / not enter TUI
