@@ -1282,12 +1282,6 @@ def test_tui_main_importable():
     assert callable(gq._gpu_summary_line)
 
 
-def test_tui_do_action_stub_returns_false():
-    """Until Task 5, _tui_do_action is a no-op stub that returns False."""
-    assert gq._tui_do_action(None, {"kind": "op", "label": "Add job",
-                                    "action": "add", "job_id": None}) is False
-
-
 def test_util_bar_width_and_chars():
     """_util_bar is always exactly `width` chars, only block chars."""
     bar = gq._util_bar(67, 12)
