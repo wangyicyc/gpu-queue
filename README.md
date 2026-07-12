@@ -85,7 +85,7 @@ gq add 'python eval.py'
 
 1. **`gq add`** —— 命令进入 `queue.json` 待跑队列。同时**快照**你当前的 shell 环境（conda/venv、PATH 等）和工作目录。
 2. **等待** —— daemon 每 `--poll` 秒检查一次 GPU 是否空闲。
-3. **执行** —— 空闲后，daemon 从队首弹出任务，用快照的环境还原后跑（`Popen(env=...)`）。stdout/stderr 直接打到 daemon 终端。
+3. **执行** —— 空闲后，daemon 从队首弹出任务，用快照的环境还原后跑（`Popen(env=...)`）。stdout/stderr 写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。
 4. **完成** —— 任务结束（exit 0 = DONE，非 0 = FAILED），daemon 清掉运行状态，继续拖下一个。
 5. **队列空** —— daemon 继续轮询，等你 `gq add` 新任务。
 
@@ -329,7 +329,7 @@ gq add 'python eval.py'
 
 1. **`gq add`** — the command enters the pending queue in `queue.json`. It also **snapshots** your current shell environment (conda/venv, PATH, …) and working directory.
 2. **Wait** — the daemon checks whether the GPU is idle every `--poll` seconds.
-3. **Run** — once idle, the daemon pops the head job and runs it with the snapshot's environment restored (`Popen(env=...)`). stdout/stderr stream straight to the daemon's terminal.
+3. **Run** — once idle, the daemon pops the head job and runs it with the snapshot's environment restored (`Popen(env=...)`). stdout/stderr go to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries).
 4. **Finish** — when the job exits (0 = DONE, non-zero = FAILED), the daemon clears the running state and moves to the next job.
 5. **Empty queue** — the daemon keeps polling, waiting for you to `gq add` more.
 
@@ -465,7 +465,7 @@ python -m pytest tests/ -v    # 87 tests
 ### Limitations
 
 - Multi-GPU parallelism: `gq` assigns jobs by card count and can run several jobs in parallel across multiple cards at once. No multi-user fair scheduling, no clustering (that's Slurm's job).
-- Job output streams to the daemon's foreground terminal and to `~/.gpu-queue/logs/<id>.log` (TUI/CLI view via Open log).
+- Job output goes to `~/.gpu-queue/logs/<id>.log` (view via TUI Open log or `tail -f`); the watch terminal prints only summaries.
 
 ### License
 

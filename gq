@@ -1003,6 +1003,7 @@ def _run_bash_for_command():
         os.close(fd)
 
     init_script = (
+        "[ -f ~/.bashrc ] && source ~/.bashrc || true\n"
         "__gq_capture() {\n"
         f"  printf '%s' \"$READLINE_LINE\" > {cmd_path}\n"
         f"  pwd > {cwd_path}\n"
