@@ -728,6 +728,42 @@ def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, c
 
 
 # ---------------------------------------------------------------------------
+# Task 2: TUI state-to-rows logic (_build_rows)
+# ---------------------------------------------------------------------------
+
+def test_build_rows_empty():
+    """No running, no queued: only static ops (Add, Clear, Quit)."""
+    rows = gq._build_rows({"daemon_pid": None, "running": {}}, [])
+    actions = [r["action"] for r in rows]
+    assert actions == ["add", "clear", "quit"]
+
+
+def test_build_rows_with_running_and_queued():
+    state = {"daemon_pid": 1, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun x", "cards": [0, 1], "pid": 9,
+                 "started_at": "2026-07-11T10:00:00", "n": 2, "env": {}}}}
+    queue = [{"id": "ef56", "cmd": "python eval.py", "n": 1, "env": {}}]
+    rows = gq._build_rows(state, queue)
+    actions = [r["action"] for r in rows]
+    # Add first, then Stop per running job, Open log per running job,
+    # Cancel per queued job, Clear, Quit.
+    assert actions == ["add", "stop", "open_log", "cancel", "clear", "quit"]
+    stop_row = next(r for r in rows if r["action"] == "stop")
+    assert stop_row["job_id"] == "ab12"
+    cancel_row = next(r for r in rows if r["action"] == "cancel")
+    assert cancel_row["job_id"] == "ef56"
+
+
+def test_build_rows_labels_contain_ids():
+    state = {"daemon_pid": 1, "running": {
+        "ab12": {"id": "ab12", "cmd": "torchrun x", "cards": [0], "pid": 9,
+                 "started_at": "2026-07-11T10:00:00", "n": 1, "env": {}}}}
+    rows = gq._build_rows(state, [])
+    labels = " ".join(r["label"] for r in rows)
+    assert "ab12" in labels  # the running job id appears in Stop/Open-log labels
+
+
+# ---------------------------------------------------------------------------
 # Task 2: busy_cards() / _total_cards() — per-card GPU state primitive
 # ---------------------------------------------------------------------------
 

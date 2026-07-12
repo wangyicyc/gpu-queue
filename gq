@@ -359,6 +359,35 @@ def _format_elapsed(seconds: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+def _build_rows(state: dict, queue: list) -> list:
+    """Build the TUI operations list from current state + queue. Pure (no curses).
+
+    Row order: Add, then one Stop + one Open-log per running job, then one
+    Cancel per queued job, then Clear, Quit. Each row:
+      {"kind": "op"|"job", "label": str, "action": str, "job_id": str|None}
+    """
+    rows = []
+    rows.append({"kind": "op", "label": "Add job",
+                 "action": "add", "job_id": None})
+    running = state.get("running") or {}
+    for rid, r in running.items():
+        cards = ",".join(str(c) for c in r.get("cards", []))
+        rows.append({"kind": "job", "label": f"Stop: {rid}  ({r.get('cmd','')} GPU {cards})",
+                     "action": "stop", "job_id": rid})
+    for rid, r in running.items():
+        rows.append({"kind": "job", "label": f"Open log: {rid}",
+                     "action": "open_log", "job_id": rid})
+    for i, job in enumerate(queue, 1):
+        rows.append({"kind": "job",
+                     "label": f"Cancel: #{i} {job['id']}  ({job.get('cmd','')})",
+                     "action": "cancel", "job_id": job["id"]})
+    rows.append({"kind": "op", "label": "Clear queue",
+                 "action": "clear", "job_id": None})
+    rows.append({"kind": "op", "label": "Quit",
+                 "action": "quit", "job_id": None})
+    return rows
+
+
 def _launch_job(job: dict, cards: list) -> Optional[subprocess.Popen]:
     """Launch a job on the given cards (non-blocking). Returns the Popen, or
     None on launch failure. Injects CUDA_VISIBLE_DEVICES into the job's env.
