@@ -2,6 +2,7 @@
 """gq — GPU Task Queue: run shell commands when your GPU is free."""
 
 import argparse
+import curses
 import datetime
 import fcntl
 import json
@@ -88,6 +89,36 @@ def busy_cards() -> set:
         except (ValueError, FileNotFoundError, PermissionError):
             continue
     return busy
+
+
+def _gpu_utilization() -> dict:
+    """Return {gpu_index: utilization_percent} via nvidia-smi.
+
+    Queries `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits`;
+    line i corresponds to GPU i. On any failure (missing binary, timeout, bad
+    output) returns {} — callers degrade to binary busy/free coloring using
+    `busy_cards()`.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    out = {}
+    for i, line in enumerate(result.stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out[i] = int(line)
+        except ValueError:
+            continue
+    return out
 
 
 def _pick_idle(idle: set, n: int) -> list:
@@ -616,6 +647,199 @@ def cmd_watch(args) -> None:
         s = read_state()
         s["daemon_pid"] = None
         write_state(s)
+
+
+# ---------------------------------------------------------------------------
+# TUI (curses): render panel + per-GPU bars + main loop
+# ---------------------------------------------------------------------------
+
+_COLORS_INITED = False
+
+
+def _init_colors():
+    """Initialize curses color pairs once. Idempotent."""
+    global _COLORS_INITED
+    if _COLORS_INITED:
+        return
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)   # idle / <50%
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # 50-80%
+    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)     # >80% / busy
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)    # hints
+    _COLORS_INITED = True
+
+
+def _util_bar(percent: int, width: int = 12) -> str:
+    """Build a fixed-width utilization bar from a percent (0-100).
+
+    Filled cells use `█`, the single fractional cell uses a half-block char
+    (`▏▎▍▌▋▊▉` for 1/8..7/8), empty cells use `░`.
+    """
+    percent = max(0, min(100, int(percent)))
+    frac = percent / 100.0 * width
+    full = int(frac)
+    rem = frac - full
+    bar = "█" * full
+    if rem > 0 and full < width:
+        idx = int(round(rem * 8))
+        if idx >= 8:
+            bar += "█"
+        elif idx > 0:
+            bar += "▏▎▍▌▋▊▉"[idx - 1]
+    bar += "░" * (width - len(bar))
+    return bar[:width]
+
+
+def _safe_addstr(stdscr, y, x, s, attr=curses.A_NORMAL):
+    """addstr that never raises: clamps to screen and avoids the bottom-right
+    corner cell (writing there raises curses.error on most implementations)."""
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    max_len = w - x
+    if y == h - 1:
+        max_len -= 1  # bottom-right corner is off-limits
+    if max_len <= 0:
+        return
+    try:
+        stdscr.addstr(y, x, str(s)[:max_len], attr)
+    except curses.error:
+        pass
+
+
+def _gpu_summary_line():
+    """One-line GPU overview for the top bar."""
+    total = _total_cards()
+    busy = busy_cards()
+    state = read_state()
+    nrun = len(state.get("running") or {})
+    nq = len(read_queue())
+    clock = datetime.datetime.now().strftime("%H:%M:%S")
+    idle = total - len(busy)
+    return f" gq  {total} GPUs ({idle} idle)  {nrun} running  {nq} queued   {clock}"
+
+
+def _render_panel(stdscr, rows, focus, gpu_summary):
+    """Render the TUI: top summary + per-GPU utilization bars + operations
+    list + bottom hint. Uses noutrefresh (caller runs doupdate) for flicker-
+    free updates.
+    """
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    _init_colors()
+    GREEN, YELLOW, RED, CYAN = 1, 2, 3, 4
+
+    # Top summary line (read-only)
+    _safe_addstr(stdscr, 0, 0, gpu_summary[:w - 1],
+                 curses.color_pair(CYAN) | curses.A_BOLD)
+
+    # Per-GPU utilization bars (one line per GPU)
+    total = _total_cards()
+    utils = _gpu_utilization()
+    busy = busy_cards()
+    state = read_state()
+    running = state.get("running") or {}
+    # Map each card index -> (job_id, running_job_dict) that owns it.
+    card_to_job = {}
+    for rid, r in running.items():
+        for c in r.get("cards", []):
+            card_to_job[c] = (rid, r)
+
+    y = 1
+    for gpu in range(total):
+        if y >= h - 1:
+            break
+        pct = utils.get(gpu)
+        if pct is None:
+            # nvidia-smi util unavailable: degrade to binary busy/free.
+            pct = 100 if gpu in busy else 0
+        if pct < 50:
+            color = GREEN
+        elif pct <= 80:
+            color = YELLOW
+        else:
+            color = RED
+        bar = _util_bar(pct, 12)
+        head = f"GPU {gpu:<2d} "
+        # Owning job id + cmd snippet + elapsed, if a running job holds this card.
+        job_info = ""
+        owner = card_to_job.get(gpu)
+        if owner is not None:
+            rid, r = owner
+            cmd = r.get("cmd") or ""
+            snippet = cmd if len(cmd) <= 18 else cmd[:17] + "…"
+            try:
+                started = datetime.datetime.fromisoformat(r["started_at"])
+                elapsed = _format_elapsed(
+                    (datetime.datetime.now() - started).total_seconds())
+            except (KeyError, ValueError, TypeError):
+                elapsed = "--:--:--"
+            job_info = f"  {rid} {snippet}  {elapsed}"
+        elif gpu in busy:
+            job_info = "  (busy)"
+        _safe_addstr(stdscr, y, 0, head, curses.A_NORMAL)
+        _safe_addstr(stdscr, y, len(head), bar, curses.color_pair(color))
+        rest = f" {pct:>3d}%{job_info}"
+        _safe_addstr(stdscr, y, len(head) + len(bar), rest)
+        y += 1
+
+    # Separator between GPU bars and operations list
+    if y < h - 1:
+        _safe_addstr(stdscr, y, 0, "-" * (w - 1))
+        y += 1
+
+    # Operations list (selectable)
+    for i, row in enumerate(rows):
+        if y >= h - 1:
+            break
+        label = row.get("label", "")[:w - 1]
+        attr = curses.A_REVERSE if i == focus else curses.A_NORMAL
+        _safe_addstr(stdscr, y, 0, label, attr)
+        y += 1
+
+    # Bottom hint
+    _safe_addstr(stdscr, h - 1, 0,
+                 " Up/Dn select  Enter confirm  q quit "[:w - 1],
+                 curses.color_pair(CYAN))
+
+    stdscr.noutrefresh()
+
+
+def _tui_do_action(stdscr, row) -> bool:
+    """Dispatch the focused row's action. STUB for Task 3 — Task 5 fills this in.
+
+    Returns True if the TUI should exit, False to continue. Until Task 5,
+    Enter is a no-op (returns False) so the TUI never crashes on selection.
+    """
+    return False
+
+
+def _tui_main(stdscr):
+    """Curses TUI main loop. stdscr is provided by curses.wrapper."""
+    curses.curs_set(0)  # hide cursor
+    stdscr.keypad(True)
+    curses.halfdelay(20)  # 2-second refresh tick; keys return immediately
+    focus = 0
+    while True:
+        state = read_state()
+        queue = read_queue()
+        rows = _build_rows(state, queue)
+        if focus >= len(rows):
+            focus = max(0, len(rows) - 1)
+        _render_panel(stdscr, rows, focus, _gpu_summary_line())
+        curses.doupdate()
+        ch = stdscr.getch()
+        if ch in (curses.KEY_UP, ord("k")):
+            focus = max(0, focus - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            focus = min(len(rows) - 1, focus + 1)
+        elif ch == ord("q"):
+            break
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if rows and 0 <= focus < len(rows):
+                done = _tui_do_action(stdscr, rows[focus])
+                if done:
+                    break
+        # any other key / timeout: just re-render on next cycle
 
 
 def main():

@@ -1269,3 +1269,68 @@ def test_launch_job_log_dir_created(tmp_path, monkeypatch):
                         lambda *a, **kw: type("P", (), {"pid": 1})())
     gq._launch_job({"id": "x1", "cmd": "echo", "cwd": str(tmp_path), "env": {}}, [0])
     assert (tmp_path / "logs").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (TUI): curses shell smoke test + _gpu_utilization helper
+# ---------------------------------------------------------------------------
+
+def test_tui_main_importable():
+    """_tui_main and _render_panel exist and are callable (curses itself is manual)."""
+    assert callable(gq._tui_main)
+    assert callable(gq._render_panel)
+    assert callable(gq._gpu_summary_line)
+
+
+def test_tui_do_action_stub_returns_false():
+    """Until Task 5, _tui_do_action is a no-op stub that returns False."""
+    assert gq._tui_do_action(None, {"kind": "op", "label": "Add job",
+                                    "action": "add", "job_id": None}) is False
+
+
+def test_util_bar_width_and_chars():
+    """_util_bar is always exactly `width` chars, only block chars."""
+    bar = gq._util_bar(67, 12)
+    assert len(bar) == 12
+    assert set(bar) <= set("█▏▎▍▌▋▊▉░")
+    # 0% -> all empty, 100% -> all full
+    assert gq._util_bar(0, 12) == "░" * 12
+    assert gq._util_bar(100, 12) == "█" * 12
+    # 50% -> half full / half empty
+    assert gq._util_bar(50, 12) == "█" * 6 + "░" * 6
+
+
+def test_gpu_utilization_parses_nvidia_smi(monkeypatch):
+    """_gpu_utilization returns {gpu_index: percent} from nvidia-smi output."""
+    class FakeResult:
+        returncode = 0
+        stdout = "67\n12\n0\n"
+
+    def fake_run(cmd, **kwargs):
+        assert cmd == ["nvidia-smi", "--query-gpu=utilization.gpu",
+                       "--format=csv,noheader,nounits"]
+        return FakeResult()
+
+    monkeypatch.setattr(gq.subprocess, "run", fake_run)
+    utils = gq._gpu_utilization()
+    assert utils == {0: 67, 1: 12, 2: 0}
+
+
+def test_gpu_utilization_failure_returns_empty(monkeypatch):
+    """On nvidia-smi failure (nonzero exit), returns {} so callers degrade."""
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(gq.subprocess, "run",
+                        lambda *a, **kw: FakeResult())
+    assert gq._gpu_utilization() == {}
+
+
+def test_gpu_utilization_missing_binary_returns_empty(monkeypatch):
+    """If nvidia-smi isn't installed (FileNotFoundError), returns {}."""
+    def boom(*a, **kw):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(gq.subprocess, "run", boom)
+    assert gq._gpu_utilization() == {}
