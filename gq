@@ -995,6 +995,50 @@ def _tui_main(stdscr):
         # any other key / timeout: just re-render on next cycle
 
 
+def _key_to_bytes(ch: int):
+    """Map a curses key code to the bytes bash/readline expect, or None if
+    the key is reserved for gq (F5 submit, Esc cancel)."""
+    import curses as _c
+    reserved = {_c.KEY_F5, 27}  # F5, Esc — gq handles these
+    if ch in reserved:
+        return None
+    arrow = {_c.KEY_UP: b"\x1b[A", _c.KEY_DOWN: b"\x1b[B",
+             _c.KEY_RIGHT: b"\x1b[C", _c.KEY_LEFT: b"\x1b[D"}
+    if ch in arrow:
+        return arrow[ch]
+    if ch == _c.KEY_ENTER:
+        return b"\r"
+    if ch == _c.KEY_BACKSPACE or ch == 127 or ch == 8:
+        return b"\x7f"
+    if 0 <= ch < 256:
+        return bytes([ch])   # printable + Ctrl combos (Ctrl-C=3, Ctrl-D=4, ...)
+    return None
+
+
+def _render_pyte_to_dialog(stdscr, screen, oy, ox, dh, dw):
+    """Render a pyte.Screen's display into curses at origin (oy, ox) within a
+    dh x dw region. Reads ``screen.display`` (a list of line strings, as
+    exposed by the real pyte Screen after ``stream.feed(...)``) and draws each
+    line padded/clamped to dw, then moves the cursor to pyte's cursor position
+    (clamped to the region). Best-effort: curses errors on edge cells are
+    swallowed.
+    """
+    import curses as _c
+    display = screen.display  # list of strings, one per line
+    for y in range(dh):
+        line = (display[y] if y < len(display) else "")[:dw].ljust(dw)
+        try:
+            stdscr.addstr(oy + y, ox, line, _c.A_NORMAL)
+        except _c.error:
+            pass
+    cx = min(getattr(screen.cursor, "x", 0), dw - 1)
+    cy = min(getattr(screen.cursor, "y", 0), dh - 1)
+    try:
+        stdscr.move(oy + cy, ox + cx)
+    except _c.error:
+        pass
+
+
 def _build_capture_rcfile(cmd_path: str, cwd_path: str, env_path: str) -> str:
     """Build the bash rcfile that lets F5 capture the current command line.
 

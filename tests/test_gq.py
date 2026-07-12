@@ -1432,3 +1432,47 @@ def test_build_capture_rcfile_content(tmp_path):
     assert r"\e[15~" in rc          # F5 bind
     assert "READLINE_LINE" in rc
     assert "env -0" in rc
+
+
+def test_key_to_bytes_arrow_and_ctrl():
+    import curses as _c
+    assert gq._key_to_bytes(_c.KEY_UP) == b"\x1b[A"
+    assert gq._key_to_bytes(_c.KEY_DOWN) == b"\x1b[B"
+    assert gq._key_to_bytes(_c.KEY_RIGHT) == b"\x1b[C"
+    assert gq._key_to_bytes(_c.KEY_LEFT) == b"\x1b[D"
+    assert gq._key_to_bytes(3) == b"\x03"              # Ctrl-C
+    assert gq._key_to_bytes(_c.KEY_ENTER) == b"\r"
+    assert gq._key_to_bytes(ord("a")) == b"a"
+    assert gq._key_to_bytes(ord("\t")) == b"\t"
+
+
+def test_key_to_bytes_reserved_returns_none():
+    import curses as _c
+    # F5 and Esc are reserved (gq handles them), not forwarded to bash.
+    assert gq._key_to_bytes(_c.KEY_F5) is None
+    assert gq._key_to_bytes(27) is None          # Esc
+
+
+def test_render_pyte_to_dialog_draws_display():
+    """A fake pyte screen with a known display line -> the right curses writes.
+
+    Real pyte Screen exposes ``display`` (list of line strings) and ``cursor``
+    with ``.x``/``.y`` after ``stream.feed(...)``; the fake matches that shape.
+    """
+    screen = type("S", (), {})()
+    screen.display = ["A"]
+    screen.cursor = type("Cur", (), {})(); screen.cursor.x = 1; screen.cursor.y = 0
+    screen.columns = 10; screen.lines = 1
+
+    class MockStd:
+        def __init__(self): self.writes = []
+        def addstr(self, *a):
+            if len(a) == 3: y, x, t = a
+            else: y, x, t = a[0], a[1], a[2]
+            self.writes.append((y, x, t))
+        def move(self, *a): pass
+        def refresh(self): pass
+    std = MockStd()
+    gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
+    # The 'A' at display[0][0] should be drawn at curses (oy+0, ox+0) = (2,5).
+    assert (2, 5, "A") in std.writes or any(w[0] == 2 and w[1] == 5 and "A" in w[2] for w in std.writes)
