@@ -1418,3 +1418,17 @@ def test_main_subcommand_still_works(monkeypatch, tmp_path):
     monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(sys, "argv", ["gq", "list"])
     gq.main()  # should not raise / not enter TUI
+
+
+def test_build_capture_rcfile_content(tmp_path):
+    """_build_capture_rcfile sources bashrc, defines __gq_capture, binds F5."""
+    cmd_path = str(tmp_path / "cmd")
+    cwd_path = str(tmp_path / "cwd")
+    env_path = str(tmp_path / "env")
+    rc = gq._build_capture_rcfile(cmd_path, cwd_path, env_path)
+    assert "source ~/.bashrc" in rc
+    assert "__gq_capture()" in rc
+    assert cmd_path in rc and cwd_path in rc and env_path in rc
+    assert r"\e[15~" in rc          # F5 bind
+    assert "READLINE_LINE" in rc
+    assert "env -0" in rc

@@ -995,6 +995,27 @@ def _tui_main(stdscr):
         # any other key / timeout: just re-render on next cycle
 
 
+def _build_capture_rcfile(cmd_path: str, cwd_path: str, env_path: str) -> str:
+    """Build the bash rcfile that lets F5 capture the current command line.
+
+    Sources ~/.bashrc (so conda/aliases work), defines __gq_capture (writes
+    $READLINE_LINE, $PWD, env -0 to the three temp files without executing
+    the command), and binds F5 (\\e[15~) to call it. Returns the rcfile
+    content string. Pure (no I/O).
+    """
+    return (
+        "[ -f ~/.bashrc ] && source ~/.bashrc || true\n"
+        "__gq_capture() {\n"
+        f"  printf '%s' \"$READLINE_LINE\" > {cmd_path}\n"
+        f"  pwd > {cwd_path}\n"
+        f"  env -0 > {env_path}\n"
+        "  exit 0\n"
+        "}\n"
+        'bind -x \'"\e[15~": "__gq_capture"\'\n'
+        '"[gq] compose your command, then press F5 to submit (Esc to cancel)."\n'
+    )
+
+
 def _run_bash_for_command():
     """Spawn an interactive bash for the user to compose/test a command. F5
     grabs the current readline line (without executing it) plus cwd + env,
@@ -1020,17 +1041,7 @@ def _run_bash_for_command():
     for fd in (cmd_fd, cwd_fd, env_fd):
         os.close(fd)
 
-    init_script = (
-        "[ -f ~/.bashrc ] && source ~/.bashrc || true\n"
-        "__gq_capture() {\n"
-        f"  printf '%s' \"$READLINE_LINE\" > {cmd_path}\n"
-        f"  pwd > {cwd_path}\n"
-        f"  env -0 > {env_path}\n"
-        "  exit 0\n"
-        "}\n"
-        'bind -x \'"\\e[15~": "__gq_capture"\'\n'
-        'echo "[gq] compose your command, then press F5 to submit to the queue (Ctrl-D to cancel)."\n'
-    )
+    init_script = _build_capture_rcfile(cmd_path, cwd_path, env_path)
     # Write the init script to a temp rcfile and pass it as `--rcfile` so bash
     # sources it at interactive startup and the F5 bind takes effect. Uses
     # NamedTemporaryFile (not mkstemp) so it doesn't consume one of the
