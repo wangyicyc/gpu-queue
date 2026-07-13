@@ -1060,6 +1060,203 @@ def _build_capture_rcfile(cmd_path: str, cwd_path: str, env_path: str) -> str:
     )
 
 
+def _run_embedded_bash(stdscr, oy, ox):
+    """Spawn a real bash in a pty, rendered inside a curses dialog at (oy, ox).
+
+    F5 submits the current command line (via the rcfile __gq_capture bind);
+    Esc cancels; Ctrl-C is forwarded to bash (gq itself ignores SIGINT during
+    the modal loop). Returns {"cmd","cwd","env"} on F5, or None on Esc / bash
+    exit. Lazy-imports pyte; if pyte is missing, prints an install hint and
+    returns None. Cleans up the pty, process, and 4 temp files on every path.
+    """
+    import curses as _c
+    try:
+        import pyte
+    except ImportError:
+        print("\n[gq] TUI add needs pyte: pip install pyte", file=sys.stderr)
+        return None
+
+    h, w = stdscr.getmaxyx()
+    dh = max(8, int(h * 0.6))
+    dw = max(40, int(w * 0.7))
+    # Clamp so the dialog fits below/right of the origin and on-screen.
+    dh = min(dh, h - oy - 1)
+    dw = min(dw, w - ox - 1)
+    if dh < 3 or dw < 3:
+        # Not enough room to draw a bordered dialog — bail cleanly.
+        return None
+
+    import tempfile, pty, select, fcntl, termios, struct, signal
+    cmd_fd, cmd_path = tempfile.mkstemp(prefix="gq_cmd_")
+    cwd_fd, cwd_path = tempfile.mkstemp(prefix="gq_cwd_")
+    env_fd, env_path = tempfile.mkstemp(prefix="gq_env_")
+    rc_fd, rc_path = tempfile.mkstemp(prefix="gq_rc_")
+    for fd in (cmd_fd, cwd_fd, env_fd, rc_fd):
+        os.close(fd)
+    # Write the rcfile simply (the skeleton's os.write guard was a no-op bug).
+    with open(rc_path, "w") as f:
+        f.write(_build_capture_rcfile(cmd_path, cwd_path, env_path))
+
+    screen = pyte.Screen(dw, dh)
+    stream = pyte.Stream(screen)
+
+    master, slave = pty.openpty()
+    # Set the pty window size so bash/readline know the dialog dimensions.
+    winsize = struct.pack("HHHH", dh, dw, 0, 0)
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        pass
+
+    import subprocess
+    try:
+        proc = subprocess.Popen(["bash", "--rcfile", rc_path, "-i"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                preexec_fn=os.setsid, env={**os.environ})
+    except Exception as exc:
+        # bash failed to spawn — clean up master + slave + temp files and bail
+        # (mirrors _run_bash_for_command). Popen is outside the main try/finally
+        # below, so it gets its own cleanup to avoid leaking fds/temp files.
+        print(f"[gq] ERROR spawning bash: {exc}", file=sys.stderr)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        try:
+            os.close(slave)
+        except OSError:
+            pass
+        for p in (cmd_path, cwd_path, env_path, rc_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+    os.close(slave)  # parent only needs master; bash keeps the slave open
+
+    # Override SIGINT so Ctrl-C is NOT delivered to gq; we forward \x03 to bash.
+    old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _tui_blocking_mode(stdscr)  # blocking getch for the modal loop
+    result = None
+    try:
+        while True:
+            # 1. Non-blocking read bash output, feed pyte.
+            while True:
+                r, _, _ = select.select([master], [], [], 0)
+                if not r:
+                    break
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                stream.feed(data.decode("utf-8", "replace"))
+            # 2. Render the dialog in a subwindow (bordered, titled) — NOT
+            # stdscr.box(), which would clobber the main panel and draw the
+            # border around the whole screen instead of the dialog region.
+            stdscr.erase()
+            try:
+                win = stdscr.subwin(dh, dw, oy, ox)
+                win.box()
+                win.addstr(0, 2, " compose (F5 submit, Esc cancel) ",
+                           _c.A_BOLD)
+                _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2)
+            except _c.error:
+                pass
+            # Bottom hint on stdscr (outside the dialog subwindow).
+            try:
+                stdscr.addstr(h - 1, 0,
+                              " F5 submit  Esc cancel  Ctrl-C interrupts test-run "[:w - 1],
+                              _c.color_pair(4))
+            except _c.error:
+                pass
+            stdscr.refresh()
+
+            # 3. Get a key (blocking, ~0.2s timeout to re-read bash output).
+            _c.halfdelay(2)  # 0.2s tick — snappier streaming than 1s
+            ch = stdscr.getch()
+            if ch == _c.KEY_F5:
+                # Forward F5 (\e[15~) to bash so the rcfile's `bind -x`
+                # fires __gq_capture, which writes the temp files (cmd, then
+                # cwd, then env) and exits bash. F5 is reserved in
+                # _key_to_bytes (not auto-forwarded), so we forward it
+                # explicitly here. __gq_capture runs asynchronously in bash,
+                # so we wait for it to finish before reading: proc.poll()
+                # becoming non-None (bash exited via `exit 0`) is the
+                # deterministic completion signal. As a fallback (e.g. tests
+                # where poll is mocked to None), env_path being non-empty also
+                # indicates completion — env is written LAST, so cmd & cwd are
+                # already written by then. 2s timeout; if the bind never fires,
+                # cmd stays empty and we return None (graceful cancel).
+                try:
+                    os.write(master, b"\x1b[15~")
+                except OSError:
+                    pass
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        break  # bash exited → __gq_capture done → all files written
+                    try:
+                        if Path(env_path).read_bytes():
+                            break  # env written last → cmd, cwd already complete
+                    except OSError:
+                        pass
+                    time.sleep(0.02)
+                try:
+                    cmd = Path(cmd_path).read_text()
+                except OSError:
+                    cmd = ""
+                if cmd:
+                    cwd = Path(cwd_path).read_text().strip()
+                    env = {}
+                    raw = Path(env_path).read_bytes()
+                    for entry in raw.split(b"\x00"):
+                        if b"=" in entry:
+                            k, _, v = entry.partition(b"=")
+                            try:
+                                env[k.decode()] = v.decode()
+                            except UnicodeDecodeError:
+                                continue
+                    result = {"cmd": cmd, "cwd": cwd, "env": env}
+                break
+            if ch == 27:  # Esc
+                break
+            kb = _key_to_bytes(ch)
+            if kb is not None:
+                try:
+                    os.write(master, kb)
+                except OSError:
+                    break
+            # If bash exited (Ctrl-D in bash), drain remaining output then break.
+            if proc.poll() is not None:
+                try:
+                    data = os.read(master, 4096)
+                    if data:
+                        stream.feed(data.decode("utf-8", "replace"))
+                except OSError:
+                    pass
+                break
+    finally:
+        _tui_restore_halfdelay(stdscr)
+        signal.signal(signal.SIGINT, old_sigint)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+        for p in (cmd_path, cwd_path, env_path, rc_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    return result
+
+
 def _run_bash_for_command():
     """Spawn an interactive bash for the user to compose/test a command. F5
     grabs the current readline line (without executing it) plus cwd + env,
