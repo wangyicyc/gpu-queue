@@ -1135,10 +1135,14 @@ def _run_embedded_bash(stdscr, oy, ox):
     os.close(slave)  # parent only needs master; bash keeps the slave open
 
     # Override SIGINT so Ctrl-C is NOT delivered to gq; we forward \x03 to bash.
-    old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    _tui_blocking_mode(stdscr)  # blocking getch for the modal loop
+    # SIGINT-ignore + blocking-mode setup lives INSIDE try so a raise from
+    # _tui_blocking_mode (curses.error on nocbreak/cbreak) is caught by finally:
+    # SIGINT restored, master closed, bash killed, temp files unlinked.
+    old_sigint = signal.SIG_DFL  # safe default in case signal.signal itself raises
     result = None
     try:
+        old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _tui_blocking_mode(stdscr)  # blocking getch for the modal loop
         while True:
             # 1. Non-blocking read bash output, feed pyte.
             while True:

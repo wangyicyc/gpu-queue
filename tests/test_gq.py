@@ -1496,7 +1496,13 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
                                                           "kill": lambda self: None,
                                                           "wait": lambda self: 0})())
     monkeypatch.setattr(_os, "close", lambda fd: None)
-    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    # Capture os.write calls so we can assert the F5-forward (b"\x1b[15~") is
+    # actually written to the pty master (fd=100 from the mocked openpty).
+    captured_writes = []
+    def fake_write(fd, data):
+        captured_writes.append((fd, bytes(data)))
+        return len(data)
+    monkeypatch.setattr(_os, "write", fake_write)
     monkeypatch.setattr(_os, "read", lambda fd, n: b"")  # no bash output
     monkeypatch.setattr(_os, "unlink", lambda p: None)
     monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
@@ -1532,6 +1538,10 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
     assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
     assert result["cwd"] == "/home/walle/proj"
     assert result["env"]["MY"] == "1"
+    # The F5-forward must actually write \e[15~ to the pty master (fd=100) so
+    # bash's `bind -x` fires __gq_capture. This assertion is the regression
+    # guard: removing the os.write(master, b"\x1b[15~") line fails here.
+    assert any(data == b"\x1b[15~" and fd == 100 for fd, data in captured_writes)
 
 
 def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
