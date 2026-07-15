@@ -1330,47 +1330,6 @@ def test_gpu_utilization_missing_binary_returns_empty(monkeypatch):
     assert gq._gpu_utilization() == {}
 
 
-def test_run_bash_for_command_reads_temp_files(tmp_path, monkeypatch):
-    """_run_bash_for_command spawns bash; on 'F5', reads cmd/cwd/env from temp files."""
-    # Simulate bash writing the temp files then exiting (the bind's effect),
-    # without actually running an interactive bash.
-    cmd_file = tmp_path / "cmd"
-    cwd_file = tmp_path / "cwd"
-    env_file = tmp_path / "env"
-    cmd_file.write_text("torchrun --nproc_per_node=4 train.py")
-    cwd_file.write_text("/home/walle/proj")
-    env_file.write_text("PATH=/x\nCUDA_VISIBLE_DEVICES=\nMY=1\n")
-
-    def fake_popen(bash_cmd, **kwargs):
-        # The real impl writes a script that bash runs; here simulate the bind
-        # having fired by returning a proc that immediately exits 0.
-        class P:
-            pid = 555
-            def wait(self):
-                return 0
-        return P()
-
-    monkeypatch.setattr(gq.subprocess, "Popen", fake_popen)
-    # Point the impl's temp-file names at our fakes by monkeypatching tempfile
-    import tempfile
-    real_mkstemp = tempfile.mkstemp
-    seq = {"n": 0}
-    def fake_mkstemp(*a, **kw):
-        seq["n"] += 1
-        # Return our pre-filled files in order: cmd, cwd, env
-        f = [cmd_file, cwd_file, env_file][seq["n"] - 1]
-        import os as _os
-        fd = _os.open(str(f), _os.O_RDONLY)
-        return fd, str(f)
-    monkeypatch.setattr(gq.tempfile, "mkstemp", fake_mkstemp)
-
-    result = gq._run_bash_for_command()
-    assert result is not None
-    assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
-    assert result["cwd"] == "/home/walle/proj"
-    assert result["env"]["MY"] == "1"
-
-
 def test_tui_do_action_quit_returns_true(monkeypatch):
     """The quit action signals the TUI to exit."""
     # _tui_do_action with a quit row returns True (done).
@@ -1418,3 +1377,284 @@ def test_main_subcommand_still_works(monkeypatch, tmp_path):
     monkeypatch.setattr(gq, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(sys, "argv", ["gq", "list"])
     gq.main()  # should not raise / not enter TUI
+
+
+def test_build_capture_rcfile_content(tmp_path):
+    """_build_capture_rcfile sources bashrc, defines __gq_capture, binds F5."""
+    cmd_path = str(tmp_path / "cmd")
+    cwd_path = str(tmp_path / "cwd")
+    env_path = str(tmp_path / "env")
+    rc = gq._build_capture_rcfile(cmd_path, cwd_path, env_path)
+    assert "source ~/.bashrc" in rc
+    assert "__gq_capture()" in rc
+    assert cmd_path in rc and cwd_path in rc and env_path in rc
+    assert r"\e[15~" in rc          # F5 bind
+    assert "echo " in rc            # hint is echoed, not run as a command
+    assert "READLINE_LINE" in rc
+    assert "env -0" in rc
+
+
+def test_key_to_bytes_arrow_and_ctrl():
+    import curses as _c
+    assert gq._key_to_bytes(_c.KEY_UP) == b"\x1b[A"
+    assert gq._key_to_bytes(_c.KEY_DOWN) == b"\x1b[B"
+    assert gq._key_to_bytes(_c.KEY_RIGHT) == b"\x1b[C"
+    assert gq._key_to_bytes(_c.KEY_LEFT) == b"\x1b[D"
+    assert gq._key_to_bytes(3) == b"\x03"              # Ctrl-C
+    assert gq._key_to_bytes(_c.KEY_ENTER) == b"\r"
+    assert gq._key_to_bytes(ord("a")) == b"a"
+    assert gq._key_to_bytes(ord("\t")) == b"\t"
+
+
+def test_key_to_bytes_reserved_returns_none():
+    import curses as _c
+    # F5 and Esc are reserved (gq handles them), not forwarded to bash.
+    assert gq._key_to_bytes(_c.KEY_F5) is None
+    assert gq._key_to_bytes(27) is None          # Esc
+
+
+def test_render_pyte_to_dialog_draws_display():
+    """A fake pyte screen with a known display line -> the right curses writes.
+
+    Real pyte Screen exposes ``display`` (list of line strings) and ``cursor``
+    with ``.x``/``.y`` after ``stream.feed(...)``; the fake matches that shape.
+    """
+    screen = type("S", (), {})()
+    screen.display = ["A"]
+    screen.cursor = type("Cur", (), {})(); screen.cursor.x = 1; screen.cursor.y = 0
+    screen.columns = 10; screen.lines = 1
+
+    class MockStd:
+        def __init__(self): self.writes = []
+        def addstr(self, *a):
+            if len(a) == 3: y, x, t = a
+            else: y, x, t = a[0], a[1], a[2]
+            self.writes.append((y, x, t))
+        def move(self, *a): pass
+        def refresh(self): pass
+    std = MockStd()
+    gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
+    # The 'A' at display[0][0] should be drawn at curses (oy+0, ox+0) = (2,5).
+    assert (2, 5, "A") in std.writes or any(w[0] == 2 and w[1] == 5 and "A" in w[2] for w in std.writes)
+
+
+def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
+    """F5 in the embedded bash reads the captured temp files and returns the
+    dict. Mocks the pty/subprocess/select/os layer so no real bash is spawned.
+    Requires pyte (skipped otherwise)."""
+    pytest.importorskip("pyte")
+    # Build fake temp files as if __gq_capture fired on F5.
+    cmd_path = tmp_path / "cmd"; cmd_path.write_text("torchrun --nproc_per_node=4 train.py")
+    cwd_path = tmp_path / "cwd"; cwd_path.write_text("/home/walle/proj")
+    env_path = tmp_path / "env"; env_path.write_bytes(b"PATH=/x\x00MY=1\x00")
+
+    # Mock the heavy modules so no real bash/pty is spawned.
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    monkeypatch.setattr(_sp, "Popen",
+                        lambda *a, **kw: type("P", (), {"pid": 1, "poll": lambda self: None,
+                                                          "kill": lambda self: None,
+                                                          "wait": lambda self: 0})())
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    # Capture os.write calls so we can assert the F5-forward (b"\x1b[15~") is
+    # actually written to the pty master (fd=100 from the mocked openpty).
+    captured_writes = []
+    def fake_write(fd, data):
+        captured_writes.append((fd, bytes(data)))
+        return len(data)
+    monkeypatch.setattr(_os, "write", fake_write)
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")  # no bash output
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    # mkstemp returns our fake paths in order: cmd, cwd, env, rc
+    seq = {"n": 0}
+    paths = [str(cmd_path), str(cwd_path), str(env_path), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    class MockWin:
+        def __init__(self): self.k = [gq.curses.KEY_F5]
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            import curses as _c
+            return _c.KEY_F5
+    # Patch halfdelay/restore to no-ops
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    result = gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    assert result is not None
+    assert result["cmd"] == "torchrun --nproc_per_node=4 train.py"
+    assert result["cwd"] == "/home/walle/proj"
+    assert result["env"]["MY"] == "1"
+    # The F5-forward must actually write \e[15~ to the pty master (fd=100) so
+    # bash's `bind -x` fires __gq_capture. This assertion is the regression
+    # guard: removing the os.write(master, b"\x1b[15~") line fails here.
+    assert any(data == b"\x1b[15~" and fd == 100 for fd, data in captured_writes)
+
+
+def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
+    """Esc cancels (returns None) without reading capture files."""
+    pytest.importorskip("pyte")
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    monkeypatch.setattr(_sp, "Popen",
+                        lambda *a, **kw: type("P", (), {"pid": 1, "poll": lambda self: None,
+                                                          "kill": lambda self: None,
+                                                          "wait": lambda self: 0})())
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    seq = {"n": 0}
+    paths = [str(tmp_path / "cmd"), str(tmp_path / "cwd"),
+             str(tmp_path / "env"), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    class MockWin:
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            return 27  # Esc
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    result = gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    assert result is None
+
+
+def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
+    """SAFETY: the Esc/teardown path must NEVER os.killpg gq's own process
+    group — that once killed the user's whole session when os.setsid didn't
+    take effect and the child shared gq's group. Verify: when the child's
+    pgid equals gq's own pgid, killpg is NOT called and only proc.kill() is.
+    """
+    pytest.importorskip("pyte")
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    # proc.pid = 5; we'll make getpgid(5) return gq's OWN group (e.g. 7) to
+    # simulate the setsid-failed case where the child is in gq's group.
+    proc = type("P", (), {"pid": 5, "poll": lambda self: None,
+                          "kill": lambda self: None,
+                          "wait": lambda self: 0})()
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    seq = {"n": 0}
+    paths = [str(tmp_path / "cmd"), str(tmp_path / "cwd"),
+             str(tmp_path / "env"), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    # getpgid(0) = gq's own group = 7; getpgid(5) = ALSO 7 (setsid failed) →
+    # the child is in gq's group → killpg MUST be skipped, only proc.kill().
+    def fake_getpgid(pid):
+        # pid 0 = caller's group; pid 5 = child, but it shares the group.
+        return 7
+    killpg_calls = []
+    kill_calls = []
+    monkeypatch.setattr(_os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    # proc.kill records
+    proc.kill = lambda: kill_calls.append("kill")
+
+    class MockWin:
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            return 27  # Esc → triggers the finally cleanup
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    # The child's group (7) equals gq's own group (7) → killpg MUST NOT fire.
+    assert killpg_calls == [], f"killpg was called on the shared group! {killpg_calls}"
+    # And the safe fallback (proc.kill) DID fire.
+    assert kill_calls == ["kill"], f"expected proc.kill fallback, got {kill_calls}"
+
+
+def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_path):
+    """When the child IS in its own session (setsid worked, pgid == child pid,
+    distinct from gq's group), killpg the child group to reap test-run children."""
+    pytest.importorskip("pyte")
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    proc = type("P", (), {"pid": 5, "poll": lambda self: None,
+                          "kill": lambda self: None,
+                          "wait": lambda self: 0})()
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    seq = {"n": 0}
+    paths = [str(tmp_path / "cmd"), str(tmp_path / "cwd"),
+             str(tmp_path / "env"), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    # getpgid(0) = 7 (gq); getpgid(5) = 5 (child is own group leader, pgid==pid).
+    def fake_getpgid(pid):
+        return 7 if pid == 0 else 5
+    killpg_calls = []
+    monkeypatch.setattr(_os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    class MockWin:
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            return 27  # Esc
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    # Child's group (5) is distinct from gq's (7) and pgid==pid → killpg(5, SIGKILL).
+    assert killpg_calls == [(5, signal.SIGKILL)], f"unexpected killpg: {killpg_calls}"

@@ -30,6 +30,9 @@ source ~/.bashrc
 
 # 验证
 gq --help
+
+# 可选：TUI 的 Add 功能需要 pyte（watch/命令行不需要）
+pip install pyte
 ```
 
 > 也可以直接 `git clone` 后 `cp gq ~/.local/bin/gq && chmod +x ~/.local/bin/gq`。
@@ -224,12 +227,14 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 
 直接敲 `gq`（不带子命令）进入一个全屏 TUI 面板，像 htop/ranger 那样用上下方向键选择操作、回车执行，不用打命令名：
 
-- **Add job** → 弹出一个真正的 bash（可以 cd、tab 补全、试跑命令），把要排队的命令打出来后按 **F5** 提交（不执行该命令），再选 `--gpus` 卡数入队。
+- **Add job** → 在 Add 行右侧展开一个嵌入式 bash 对话框（60% 高，70% 宽），可以 cd、tab 补全、试跑命令；打好要排队的命令后按 **F5** 提交（不执行该命令），**Esc** 取消，**Ctrl-C** 中断正在试跑的命令。提交后选 `--gpus` 卡数入队。
 - **Stop: <id>** / **Cancel: #<n> <id>** → 选中回车，确认后停/取消该任务。
 - **Clear queue** / **Quit** → 回车执行。
 - **Open log: <id>** → 查看该任务的输出日志尾部。
 
 面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。`gq watch` 仍是起 daemon 的命令（在 tmux 里常驻），任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
+
+> TUI 的 Add 功能依赖 pyte 库：`pip install pyte`（watch/命令行不需要）
 
 ### 测试
 
@@ -276,6 +281,9 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 
 gq --help
+
+# Optional: TUI Add requires pyte (watch/CLI work without it)
+pip install pyte
 ```
 
 ### Usage
@@ -449,12 +457,14 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 
 Typing bare `gq` (no subcommand) opens a full-screen TUI — htop/ranger-style: arrow keys to select an operation, Enter to run it, no command typing.
 
-- **Add job** → spawns a real bash (you can cd, tab-complete, test-run), type the command to queue, press **F5** to submit it (without executing), then pick `--gpus`.
+- **Add job** → opens an embedded bash dialog to the right of the Add row (60% height, 70% width); you can cd, tab-complete, test-run commands. Type the command to queue, press **F5** to submit (without executing), **Esc** to cancel, **Ctrl-C** to interrupt a test-run command. Then pick `--gpus`.
 - **Stop: <id>** / **Cancel: #<n> <id>** → select, Enter, confirm.
 - **Clear queue** / **Quit** → Enter.
 - **Open log: <id>** → view that job's log tail.
 
 The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. `gq watch` still starts the daemon (in tmux); task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
+
+> TUI Add requires the pyte library: `pip install pyte` (watch/CLI work without it)
 
 ### Tests
 
