@@ -1389,6 +1389,7 @@ def test_build_capture_rcfile_content(tmp_path):
     assert "__gq_capture()" in rc
     assert cmd_path in rc and cwd_path in rc and env_path in rc
     assert r"\e[15~" in rc          # F5 bind
+    assert "echo " in rc            # hint is echoed, not run as a command
     assert "READLINE_LINE" in rc
     assert "env -0" in rc
 

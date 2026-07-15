@@ -1055,8 +1055,8 @@ def _build_capture_rcfile(cmd_path: str, cwd_path: str, env_path: str) -> str:
         f"  env -0 > {env_path}\n"
         "  exit 0\n"
         "}\n"
-        'bind -x \'"\e[15~": "__gq_capture"\'\n'
-        '"[gq] compose your command, then press F5 to submit (Esc to cancel)."\n'
+        'bind -x \'"\\e[15~": "__gq_capture"\'\n'
+        'echo "[gq] compose your command, then press F5 to submit (Esc to cancel)."\n'
     )
 
 
@@ -1143,6 +1143,22 @@ def _run_embedded_bash(stdscr, oy, ox):
     try:
         old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         _tui_blocking_mode(stdscr)  # blocking getch for the modal loop
+        # cbreak (set by curses.wrapper / _tui_blocking_mode) keeps ISIG, so the
+        # tty driver intercepts Ctrl-C (SIGINT, which gq ignores) and never
+        # delivers \x03 to getch. raw() clears ISIG so \x03 reaches getch →
+        # _key_to_bytes(3) forwards it to bash's foreground job. Also show the
+        # cursor so the user can see their input position in the dialog (the
+        # main TUI loop hides it via curs_set(0)). Guard each call: some
+        # terminals reject raw/curs_set, and the mocked tests run without
+        # initscr() so these module-level calls raise curses.error there.
+        try:
+            _c.raw()
+        except _c.error:
+            pass
+        try:
+            _c.curs_set(1)
+        except _c.error:
+            pass
         while True:
             # 1. Non-blocking read bash output, feed pyte.
             while True:
@@ -1242,14 +1258,34 @@ def _run_embedded_bash(stdscr, oy, ox):
                     pass
                 break
     finally:
+        # Leave raw mode and return to cbreak (what the main TUI loop expects),
+        # then hide the cursor again (the main TUI loop uses curs_set(0)).
+        # Guard each: mocked tests run without initscr(), and some terminals
+        # reject these; a raise here must not mask the original try-body error
+        # or skip the remaining cleanup (master close, killpg, temp unlink).
+        try:
+            _c.noraw()
+            _c.cbreak()
+        except _c.error:
+            pass
+        try:
+            _c.curs_set(0)
+        except _c.error:
+            pass
         _tui_restore_halfdelay(stdscr)
         signal.signal(signal.SIGINT, old_sigint)
         try:
             os.close(master)
         except OSError:
             pass
+        # bash was started with os.setsid (own session/group), so a test-run
+        # child would be reparented to init and keep running (could hold a GPU)
+        # if we only SIGKILL bash. killpg the whole group, then reap.
         try:
-            proc.kill()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
             proc.wait()
         except Exception:
             pass
