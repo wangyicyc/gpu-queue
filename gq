@@ -1278,13 +1278,39 @@ def _run_embedded_bash(stdscr, oy, ox):
             os.close(master)
         except OSError:
             pass
-        # bash was started with os.setsid (own session/group), so a test-run
-        # child would be reparented to init and keep running (could hold a GPU)
-        # if we only SIGKILL bash. killpg the whole group, then reap.
+        # Reap the embedded bash and any test-run child it spawned, WITHOUT
+        # ever killpg-ing gq's own process group (which would SIGKILL this
+        # terminal/tmux/all sibling processes — a real incident the naive
+        # `killpg(getpgid(proc.pid))` caused when os.setsid didn't take effect
+        # and the child shared gq's group). bash was started with os.setsid so
+        # it SHOULD be its own group leader; verify that before killpg, and
+        # fall back to proc.kill() (bash only) if the groups coincide or look
+        # off — leaving a test-run child orphaned is far better than killing
+        # the user's session.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            child_pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
-            pass
+            child_pgid = None
+        my_pgid = os.getpgid(0)  # gq's own process group
+        killed_group = False
+        if (child_pgid is not None
+                and child_pgid != my_pgid
+                and child_pgid > 0
+                and child_pgid != proc.pid + 1):  # extra guard; never a near-pid group
+            # SAFETY: only killpg a group we've confirmed is the CHILD's own
+            # session (setsid made bash a group leader, so pgid == child pid).
+            if child_pgid == proc.pid:
+                try:
+                    os.killpg(child_pgid, signal.SIGKILL)
+                    killed_group = True
+                except (ProcessLookupError, OSError):
+                    pass
+        if not killed_group:
+            # Groups coincide or look unsafe — kill bash only, never gq's group.
+            try:
+                proc.kill()
+            except Exception:
+                pass
         try:
             proc.wait()
         except Exception:

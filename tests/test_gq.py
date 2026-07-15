@@ -1544,3 +1544,117 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
 
     result = gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     assert result is None
+
+
+def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
+    """SAFETY: the Esc/teardown path must NEVER os.killpg gq's own process
+    group — that once killed the user's whole session when os.setsid didn't
+    take effect and the child shared gq's group. Verify: when the child's
+    pgid equals gq's own pgid, killpg is NOT called and only proc.kill() is.
+    """
+    pytest.importorskip("pyte")
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    # proc.pid = 5; we'll make getpgid(5) return gq's OWN group (e.g. 7) to
+    # simulate the setsid-failed case where the child is in gq's group.
+    proc = type("P", (), {"pid": 5, "poll": lambda self: None,
+                          "kill": lambda self: None,
+                          "wait": lambda self: 0})()
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    seq = {"n": 0}
+    paths = [str(tmp_path / "cmd"), str(tmp_path / "cwd"),
+             str(tmp_path / "env"), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    # getpgid(0) = gq's own group = 7; getpgid(5) = ALSO 7 (setsid failed) →
+    # the child is in gq's group → killpg MUST be skipped, only proc.kill().
+    def fake_getpgid(pid):
+        # pid 0 = caller's group; pid 5 = child, but it shares the group.
+        return 7
+    killpg_calls = []
+    kill_calls = []
+    monkeypatch.setattr(_os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    # proc.kill records
+    proc.kill = lambda: kill_calls.append("kill")
+
+    class MockWin:
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            return 27  # Esc → triggers the finally cleanup
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    # The child's group (7) equals gq's own group (7) → killpg MUST NOT fire.
+    assert killpg_calls == [], f"killpg was called on the shared group! {killpg_calls}"
+    # And the safe fallback (proc.kill) DID fire.
+    assert kill_calls == ["kill"], f"expected proc.kill fallback, got {kill_calls}"
+
+
+def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_path):
+    """When the child IS in its own session (setsid worked, pgid == child pid,
+    distinct from gq's group), killpg the child group to reap test-run children."""
+    pytest.importorskip("pyte")
+    import pty as _pty, subprocess as _sp, select as _sel, os as _os, signal as _sig
+    monkeypatch.setattr(_pty, "openpty", lambda: (100, 101))
+    proc = type("P", (), {"pid": 5, "poll": lambda self: None,
+                          "kill": lambda self: None,
+                          "wait": lambda self: 0})()
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **kw: proc)
+    monkeypatch.setattr(_os, "close", lambda fd: None)
+    monkeypatch.setattr(_os, "write", lambda fd, data: len(data))
+    monkeypatch.setattr(_os, "read", lambda fd, n: b"")
+    monkeypatch.setattr(_os, "unlink", lambda p: None)
+    monkeypatch.setattr(_sel, "select", lambda r, w, x, t=None: ([], [], []))
+    seq = {"n": 0}
+    paths = [str(tmp_path / "cmd"), str(tmp_path / "cwd"),
+             str(tmp_path / "env"), str(tmp_path / "rc")]
+    def fake_mkstemp(*a, **kw):
+        seq["n"] += 1
+        return (seq["n"], paths[seq["n"] - 1])
+    import tempfile as _tf
+    monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+
+    # getpgid(0) = 7 (gq); getpgid(5) = 5 (child is own group leader, pgid==pid).
+    def fake_getpgid(pid):
+        return 7 if pid == 0 else 5
+    killpg_calls = []
+    monkeypatch.setattr(_os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    class MockWin:
+        def getmaxyx(self): return (24, 80)
+        def box(self): pass
+        def addstr(self, *a, **kw): pass
+        def refresh(self): pass
+        def erase(self): pass
+        def move(self, *a): pass
+        def subwin(self, *a): return self
+        def getch(self):
+            return 27  # Esc
+    monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
+    monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
+    monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+
+    gq._run_embedded_bash(MockWin(), oy=2, ox=0)
+    # Child's group (5) is distinct from gq's (7) and pgid==pid → killpg(5, SIGKILL).
+    assert killpg_calls == [(5, signal.SIGKILL)], f"unexpected killpg: {killpg_calls}"
