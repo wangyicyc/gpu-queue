@@ -1461,6 +1461,7 @@ def test_render_pyte_to_dialog_draws_display():
             self.writes.append((y, x, t))
         def move(self, *a): pass
         def refresh(self): pass
+        def noutrefresh(self): pass
     std = MockStd()
     gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
     # The 'A' at display[0][0] should be drawn at curses (oy+0, ox+0) = (2,5).
@@ -1516,6 +1517,7 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
+        def noutrefresh(self): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1526,6 +1528,7 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
     monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+    monkeypatch.setattr(gq.curses, "doupdate", lambda: None)
 
     result = gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     assert result is not None
@@ -1572,6 +1575,7 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
+        def noutrefresh(self): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1580,6 +1584,7 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
     monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+    monkeypatch.setattr(gq.curses, "doupdate", lambda: None)
 
     result = gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     assert result is None
@@ -1632,6 +1637,7 @@ def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
+        def noutrefresh(self): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1640,6 +1646,7 @@ def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
     monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+    monkeypatch.setattr(gq.curses, "doupdate", lambda: None)
 
     gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     # The child's group (7) equals gq's own group (7) → killpg MUST NOT fire.
@@ -1685,6 +1692,7 @@ def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_pat
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
+        def noutrefresh(self): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1693,6 +1701,7 @@ def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_pat
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
     monkeypatch.setattr(gq.curses, "halfdelay", lambda n: None)
+    monkeypatch.setattr(gq.curses, "doupdate", lambda: None)
 
     gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     # Child's group (5) is distinct from gq's (7) and pgid==pid → killpg(5, SIGKILL).

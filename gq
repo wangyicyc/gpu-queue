@@ -1285,6 +1285,12 @@ def _run_embedded_bash(stdscr, oy, ox):
             _c.curs_set(1)
         except _c.error:
             pass
+        # Create the dialog subwindow ONCE and reuse it every cycle (creating a
+        # new subwin per iteration is wasteful and contributes to input lag).
+        try:
+            win = stdscr.subwin(dh, dw, oy, ox)
+        except _c.error:
+            win = stdscr
         while True:
             # 1. Non-blocking read bash output, feed pyte.
             while True:
@@ -1298,16 +1304,16 @@ def _run_embedded_bash(stdscr, oy, ox):
                 if not data:
                     break
                 stream.feed(data.decode("utf-8", "replace"))
-            # 2. Render the dialog in a subwindow (bordered, titled) — NOT
-            # stdscr.box(), which would clobber the main panel and draw the
-            # border around the whole screen instead of the dialog region.
-            stdscr.erase()
+            # 2. Render the dialog — erase only the subwindow (not the whole
+            # stdscr), redraw border + pyte content. Using noutrefresh +
+            # doupdate (batched, no flicker) instead of refresh.
             try:
-                win = stdscr.subwin(dh, dw, oy, ox)
+                win.erase()
                 win.box()
                 win.addstr(0, 2, " compose (F5 submit, Esc cancel) ",
                            _c.A_BOLD)
                 _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2)
+                win.noutrefresh()
             except _c.error:
                 pass
             # Bottom hint on stdscr (outside the dialog subwindow).
@@ -1317,7 +1323,8 @@ def _run_embedded_bash(stdscr, oy, ox):
                               _c.color_pair(4))
             except _c.error:
                 pass
-            stdscr.refresh()
+            stdscr.noutrefresh()
+            _c.doupdate()
 
             # 3. Get a key (blocking, ~0.2s timeout to re-read bash output).
             _c.halfdelay(2)  # 0.2s tick — snappier streaming than 1s
