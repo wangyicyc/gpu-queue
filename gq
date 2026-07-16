@@ -1135,18 +1135,19 @@ def _tui_main(stdscr):
 
 def _key_to_bytes(ch: int):
     """Map a curses key code to the bytes bash/readline expect, or None if
-    the key is reserved for gq (F5/Enter submit, Esc cancel)."""
+    the key is reserved for gq (F5 submit, Esc cancel). Enter is NOT reserved
+    — it executes the command in bash (for cd/source/test-run), and F5 submits
+    the current command line to the gq queue without executing."""
     import curses as _c
-    # F5, Esc, and Enter are ALL reserved for gq — Enter submits the command
-    # (like F5) instead of executing it in bash, so the user can't accidentally
-    # run a training command while composing.
-    reserved = {_c.KEY_F5, 27, _c.KEY_ENTER, 10, 13}
+    reserved = {_c.KEY_F5, 27}  # F5, Esc — gq handles these
     if ch in reserved:
         return None
     arrow = {_c.KEY_UP: b"\x1b[A", _c.KEY_DOWN: b"\x1b[B",
              _c.KEY_RIGHT: b"\x1b[C", _c.KEY_LEFT: b"\x1b[D"}
     if ch in arrow:
         return arrow[ch]
+    if ch == _c.KEY_ENTER:
+        return b"\r"
     if ch == _c.KEY_BACKSPACE or ch == 127 or ch == 8:
         return b"\x7f"
     if 0 <= ch < 256:
@@ -1435,7 +1436,7 @@ def _run_embedded_bash(stdscr, oy, ox):
             stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
-            if ch == _c.KEY_F5 or ch == _c.KEY_ENTER or ch == 10 or ch == 13:
+            if ch == _c.KEY_F5:
                 # Forward F5 (\e[15~) to bash so the rcfile's `bind -x`
                 # fires __gq_capture, which writes the temp files (cmd, then
                 # cwd, then env) and exits bash. F5 is reserved in
