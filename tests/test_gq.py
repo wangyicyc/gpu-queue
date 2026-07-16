@@ -1442,30 +1442,33 @@ def test_key_to_bytes_reserved_returns_none():
     assert gq._key_to_bytes(27) is None          # Esc
 
 
-def test_render_pyte_to_dialog_draws_display():
-    """A fake pyte screen with a known display line -> the right curses writes.
+def test_render_pyte_to_dialog_draws_buffer():
+    """A fake pyte screen with a known buffer -> the right curses writes.
 
-    Real pyte Screen exposes ``display`` (list of line strings) and ``cursor``
-    with ``.x``/``.y`` after ``stream.feed(...)``; the fake matches that shape.
+    Real pyte Screen exposes ``buffer`` (dict[(y,x)] -> Char with .data/.fg)
+    and ``cursor`` with ``.x``/``.y``. The fake matches that shape.
     """
+    Char = type("Char", (), {})
+    c = Char(); c.data = "A"; c.fg = "default"; c.bg = "default"
+    c.bold = False; c.reverse = False; c.underscore = False
     screen = type("S", (), {})()
-    screen.display = ["A"]
+    screen.buffer = {0: {0: c}}  # buffer[y][x] -> Char
     screen.cursor = type("Cur", (), {})(); screen.cursor.x = 1; screen.cursor.y = 0
-    screen.columns = 10; screen.lines = 1
 
     class MockStd:
         def __init__(self): self.writes = []
-        def addstr(self, *a):
-            if len(a) == 3: y, x, t = a
-            else: y, x, t = a[0], a[1], a[2]
+        def addstr(self, *a, **kw):
+            # addstr(y, x, text) or addstr(y, x, text, attr)
+            y, x, t = a[0], a[1], a[2]
             self.writes.append((y, x, t))
         def move(self, *a): pass
         def refresh(self): pass
         def noutrefresh(self): pass
     std = MockStd()
     gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
-    # The 'A' at display[0][0] should be drawn at curses (oy+0, ox+0) = (2,5).
-    assert (2, 5, "A") in std.writes or any(w[0] == 2 and w[1] == 5 and "A" in w[2] for w in std.writes)
+    # The 'A' at buffer[(0,0)] should be drawn at curses (oy+0, ox+0) = (2,5).
+    assert any(w[0] == 2 and w[1] == 5 and "A" in w[2] for w in std.writes), \
+        f"expected 'A' at (2,5), got: {std.writes}"
 
 
 def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):

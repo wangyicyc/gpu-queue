@@ -1142,21 +1142,63 @@ def _key_to_bytes(ch: int):
 
 
 def _render_pyte_to_dialog(stdscr, screen, oy, ox, dh, dw):
-    """Render a pyte.Screen's display into curses at origin (oy, ox) within a
-    dh x dw region. Reads ``screen.display`` (a list of line strings, as
-    exposed by the real pyte Screen after ``stream.feed(...)``) and draws each
-    line padded/clamped to dw, then moves the cursor to pyte's cursor position
-    (clamped to the region). Best-effort: curses errors on edge cells are
-    swallowed.
+    """Render a pyte.Screen's buffer into curses at origin (oy, ox) within a
+    dh x dw region, preserving per-character colors (so the bash prompt shows
+    green, etc.). Reads screen.buffer (dict[(y,x)] -> Char with fg/bg/bold/...)
+    and groups consecutive chars with the same attributes into one addstr call.
+    Moves the cursor to pyte's cursor position (so the user sees where typing
+    will appear). Best-effort: curses errors on edge cells are swallowed.
     """
     import curses as _c
-    display = screen.display  # list of strings, one per line
+    # Map pyte color names -> curses color pair numbers (1=green, 2=yellow,
+    # 3=red, 4=cyan, as initialized by _init_colors). Default = no color.
+    fg_to_pair = {"green": 1, "yellow": 2, "red": 3, "cyan": 4,
+                  "blue": 4, "magenta": 4}
+    buffer = screen.buffer
     for y in range(dh):
-        line = (display[y] if y < len(display) else "")[:dw].ljust(dw)
-        try:
-            stdscr.addstr(oy + y, ox, line, _c.A_NORMAL)
-        except _c.error:
-            pass
+        x = 0
+        while x < dw:
+            # Collect a run of chars with the same attributes.
+            ch = buffer[y][x] if y in buffer and x in buffer[y] else None
+            if ch is None:
+                # No char at this position — write a space and advance.
+                x += 1
+                continue
+            run_attr = _c.A_NORMAL
+            if getattr(ch, "bold", False):
+                run_attr |= _c.A_BOLD
+            if getattr(ch, "reverse", False):
+                run_attr |= _c.A_REVERSE
+            if getattr(ch, "underscore", False):
+                run_attr |= _c.A_UNDERLINE
+            fg = getattr(ch, "fg", "default")
+            pair = fg_to_pair.get(fg, 0)  # 0 = default (no color pair)
+            if pair:
+                run_attr |= _c.color_pair(pair)
+            # Gather consecutive chars with the same fg/bold/reverse/underscore.
+            run_chars = []
+            while x < dw:
+                c = buffer[y][x] if y in buffer and x in buffer[y] else None
+                if c is None:
+                    break
+                c_fg = getattr(c, "fg", "default")
+                c_attr = (_c.A_BOLD if getattr(c, "bold", False) else 0) \
+                         | (_c.A_REVERSE if getattr(c, "reverse", False) else 0) \
+                         | (_c.A_UNDERLINE if getattr(c, "underscore", False) else 0)
+                if c_fg != fg or c_attr != (run_attr & (_c.A_BOLD | _c.A_REVERSE | _c.A_UNDERLINE)):
+                    break
+                run_chars.append(c.data if c.data else " ")
+                x += 1
+            if run_chars:
+                try:
+                    stdscr.addstr(oy + y, ox + x - len(run_chars),
+                                  "".join(run_chars), run_attr)
+                except _c.error:
+                    pass
+        # Clear remaining cells on this line (if any) to avoid stale chars.
+        # (Already covered by win.erase() before render, so this is a no-op
+        # safety net.)
+    # Move the cursor to pyte's cursor position (clamped to the region).
     cx = min(getattr(screen.cursor, "x", 0), dw - 1)
     cy = min(getattr(screen.cursor, "y", 0), dh - 1)
     try:
