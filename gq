@@ -837,9 +837,10 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
     h, w = stdscr.getmaxyx()
     _init_colors()
     GREEN, YELLOW, RED, CYAN = 1, 2, 3, 4
+    PAD = 4  # left padding so content isn't flush against the edge
 
     # Top summary line (read-only)
-    _safe_addstr(stdscr, 0, 0, gpu_summary[:w - 1],
+    _safe_addstr(stdscr, 0, PAD, gpu_summary[:w - 1 - PAD],
                  curses.color_pair(CYAN) | curses.A_BOLD)
 
     # Per-GPU utilization bars (one line per GPU)
@@ -882,29 +883,29 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
             job_info = f"  {rid} {snippet}  {elapsed}"
         elif gpu in busy:
             job_info = "  (busy)"
-        _safe_addstr(stdscr, y, 0, head, curses.A_NORMAL)
-        _safe_addstr(stdscr, y, len(head), bar, curses.color_pair(color))
+        _safe_addstr(stdscr, y, PAD, head, curses.A_NORMAL)
+        _safe_addstr(stdscr, y, PAD + len(head), bar, curses.color_pair(color))
         rest = f" {pct:>3d}%{job_info}"
-        _safe_addstr(stdscr, y, len(head) + len(bar), rest)
+        _safe_addstr(stdscr, y, PAD + len(head) + len(bar), rest)
         y += 1
 
     # Separator between GPU bars and operations list
     if y < h - 1:
-        _safe_addstr(stdscr, y, 0, "-" * (w - 1))
+        _safe_addstr(stdscr, y, PAD, "-" * (w - 1 - 2 * PAD))
         y += 1
 
-    # Operations list (selectable)
+    # Operations list (selectable) — double-spaced (y += 2) for readability
     for i, row in enumerate(rows):
         if y >= h - 1:
             break
-        label = row.get("label", "")[:w - 1]
+        label = row.get("label", "")[:w - 1 - PAD]
         attr = curses.A_REVERSE if i == focus else curses.A_NORMAL
-        _safe_addstr(stdscr, y, 0, label, attr)
-        y += 1
+        _safe_addstr(stdscr, y, PAD, label, attr)
+        y += 2
 
     # Bottom hint
-    _safe_addstr(stdscr, h - 1, 0,
-                 " Up/Dn select  Enter confirm  q quit "[:w - 1],
+    _safe_addstr(stdscr, h - 1, PAD,
+                 " Up/Dn select  Enter confirm  q quit "[:w - 1 - PAD],
                  curses.color_pair(CYAN))
 
     stdscr.noutrefresh()
@@ -957,7 +958,8 @@ def _tui_confirm(stdscr, focus_y, label, msg):
     if not (0 <= focus_y < h):
         focus_y = h - 2  # fallback to near-bottom if the row is off-screen
     # Clear from end of label to end of line, then write the prompt inline.
-    x = min(len(label) + 1, w - 1)
+    # Label starts at x=4 (PAD), so the prompt x = PAD + len(label) + 1.
+    x = min(4 + len(label) + 1, w - 1)
     _safe_addstr(stdscr, focus_y, x, " " * (w - 1 - x))
     prompt = f"  {msg} [y/n]"
     _safe_addstr(stdscr, focus_y, x, prompt[:w - 1 - x],
@@ -1013,12 +1015,13 @@ def _tui_do_action(stdscr, row, focus) -> bool:
     if action == "quit":
         return True
     # Screen y of the focused operations-list row: 1 (top status) + N GPU
-    # bars + 1 separator + focus. Used to draw confirm prompts inline.
-    focus_y = 1 + _total_cards() + 1 + focus
+    # bars + 1 separator + focus * 2 (double-spaced). Used to draw confirm
+    # prompts inline. PAD offset is applied where the prompt x is computed.
+    focus_y = 1 + _total_cards() + 1 + focus * 2
     label = row.get("label", "")
     if action == "add":
-        # Dialog origin: the Add row's screen y, just after the "Add job" label.
-        captured = _run_embedded_bash(stdscr, oy=focus_y, ox=len("Add job") + 2)
+        # Dialog origin: the Add row's screen y, x after label + padding.
+        captured = _run_embedded_bash(stdscr, oy=focus_y, ox=4 + len("Add job") + 2)
         if not captured:
             return False  # user cancelled in bash
         n = _tui_select_gpus(stdscr)
