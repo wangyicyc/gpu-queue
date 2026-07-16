@@ -1366,6 +1366,18 @@ def _run_embedded_bash(stdscr, oy, ox):
             except _c.error:
                 pass
             stdscr.noutrefresh()
+            # Move the cursor to pyte's cursor position AFTER all noutrefresh
+            # calls (stdscr.noutrefresh above resets the cursor to wherever
+            # stdscr's last addstr left it, i.e. the bottom hint line). Only
+            # by moving AFTER noutrefresh and BEFORE doupdate does the cursor
+            # appear at the user's typing position. The +1 offsets account for
+            # the dialog's 1-cell border.
+            try:
+                cx = min(getattr(screen.cursor, "x", 0), dw - 2)
+                cy = min(getattr(screen.cursor, "y", 0), dh - 2)
+                stdscr.move(oy + 1 + cy, ox + 1 + cx)
+            except _c.error:
+                pass
             _c.doupdate()
 
             # 3. Get a key (blocking, ~0.2s timeout to re-read bash output).
