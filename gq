@@ -765,14 +765,17 @@ _COLORS_INITED = False
 
 
 def _init_colors():
-    """Initialize curses color pairs once. Idempotent."""
+    """Initialize curses color pairs once. Idempotent. No-op on colorless
+    terminals (curses.has_colors() is False) — renderers fall back to
+    A_NORMAL/A_REVERSE which need no color pair."""
     global _COLORS_INITED
     if _COLORS_INITED:
         return
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)   # idle / <50%
-    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # 50-80%
-    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)     # >80% / busy
-    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)    # hints
+    if curses.has_colors():
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)   # idle / <50%
+        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # 50-80%
+        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)     # >80% / busy
+        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)    # hints
     _COLORS_INITED = True
 
 
@@ -980,16 +983,18 @@ def _tui_confirm(stdscr, focus_y, label, msg):
 def _tui_select_gpus(stdscr):
     """Curses list-select for --gpus in 1..N. Returns the selected int, or 1."""
     n = _total_cards()
+    if n <= 0:
+        return 1  # degenerate: no GPUs detected — default to single-card
     choices = list(range(1, n + 1))
     focus = 0
     h, w = stdscr.getmaxyx()
     _tui_blocking_mode(stdscr)
     try:
         while True:
-            stdscr.addstr(h - 2, 0, " " * (w - 1))
+            _safe_addstr(stdscr, h - 2, 0, " " * (w - 1))
             line = " --gpus: " + "  ".join(f"[{c}]" if i == focus else f" {c} "
                                            for i, c in enumerate(choices))
-            stdscr.addstr(h - 2, 0, line[:w - 1], curses.A_BOLD)
+            _safe_addstr(stdscr, h - 2, 0, line[:w - 1], curses.A_BOLD)
             ch = stdscr.getch()
             if ch in (curses.KEY_LEFT, ord("h")):
                 focus = max(0, focus - 1)
@@ -1061,12 +1066,12 @@ def _tui_show_log(stdscr, log_path):
     except OSError:
         text = "(no log yet)"
     lines = text.splitlines()[-(h - 2):]
-    stdscr.addstr(0, 0, f" log: {log_path}"[:w - 1], curses.A_BOLD)
+    _safe_addstr(stdscr, 0, 0, f" log: {log_path}"[:w - 1], curses.A_BOLD)
     for i, ln in enumerate(lines, 1):
         if i >= h - 1:
             break
-        stdscr.addstr(i, 0, ln[:w - 1])
-    stdscr.addstr(h - 1, 0, " any key to return "[:w - 1], curses.color_pair(4))
+        _safe_addstr(stdscr, i, 0, ln[:w - 1])
+    _safe_addstr(stdscr, h - 1, 0, " any key to return "[:w - 1], curses.color_pair(4))
     _tui_blocking_mode(stdscr)
     try:
         stdscr.getch()
