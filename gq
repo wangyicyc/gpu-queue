@@ -348,6 +348,53 @@ def cmd_clear(args) -> None:
     print(f"[gq] cleared {n} pending job{'s' if n != 1 else ''}.")
 
 
+def _kill_pid_and_children(pid: int) -> None:
+    """SIGKILL a pid AND its direct children — WITHOUT os.killpg (which could
+    hit gq's own group if setsid didn't take effect). Used as the safe fallback
+    when the three-way killpg guard declines to fire: kill the shell pid, then
+    walk /proc to find children whose PPID == pid and kill each individually.
+    This deliberately does NOT recurse beyond one level and does NOT use
+    killpg — leaving deeper descendants orphaned is far better than risking
+    gq's session. /proc/<pid>/stat format is "pid (comm) state ppid ...";
+    `comm` may contain spaces and parens, so split from the LAST ')'.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        return
+    # Enumerate children via /proc/*/stat: kill any whose PPID == pid.
+    import os as _os
+    try:
+        entries = _os.listdir("/proc")
+    except OSError:
+        return
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "r") as f:
+                stat = f.read()
+        except (FileNotFoundError, ProcessLookupError, OSError):
+            continue
+        # stat = "pid (comm) state ppid ..." — comm may contain spaces/parens,
+        # so split on the last ')' and parse the remainder.
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        rest = stat[rparen + 2:].split()  # "state ppid ..."
+        if len(rest) < 2:
+            continue
+        try:
+            ppid = int(rest[1])
+        except ValueError:
+            continue
+        if ppid == pid:
+            try:
+                _os.kill(int(name), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+
 def cmd_stop(args) -> None:
     """Stop a specific running job by ID (SIGKILL its process group).
 
@@ -372,15 +419,34 @@ def cmd_stop(args) -> None:
     if not rpid:
         print(f"[gq] job {target_id} has no pid yet (not fully started).")
         return
+    # SAFETY: jobs are launched with start_new_session=True so the job's process
+    # group SHOULD equal its pid. But os.setsid/start_new_session can fail to
+    # take effect (this exact bug once SIGKILLed the user's whole session when
+    # the child shared gq's group). Verify the group is the child's OWN and is
+    # NOT gq's group before killpg; otherwise kill only the job pid, never gq's
+    # group. (See the matching guard in _run_embedded_bash's finally block.)
     try:
-        pgid = os.getpgid(rpid)
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+        child_pgid = os.getpgid(rpid)
+    except (ProcessLookupError, OSError):
         print(f"[gq] job {target_id} already finished (pid {rpid} not found).")
         return
     except PermissionError as exc:
         print(f"[gq] ERROR: cannot stop job {target_id} (pid {rpid}): {exc}")
         return
+    my_pgid = os.getpgid(0)
+    killed_group = False
+    if (child_pgid == rpid and child_pgid != my_pgid and child_pgid > 0):
+        try:
+            os.killpg(child_pgid, signal.SIGKILL)
+            killed_group = True
+        except (ProcessLookupError, OSError):
+            pass
+    if not killed_group:
+        # Groups coincide or look unsafe — kill the job pid AND its direct
+        # children (the real command, spawned by /bin/sh -c), but WITHOUT
+        # killpg so gq's own group is never hit. _kill_pid_and_children walks
+        # /proc for PPID==pid children.
+        _kill_pid_and_children(rpid)
     print(f"[gq] stopped job {target_id} (pid {rpid}).")
 
 
@@ -440,6 +506,12 @@ def _launch_job(job: dict, cards: list) -> Optional[subprocess.Popen]:
         return None
     print(f"[gq] >>> {job['cmd']}   (GPU {','.join(str(c) for c in cards)})   log: {log_path}")
     try:
+        # TODO(treatment): after Popen, verify os.getpgid(proc.pid) == proc.pid
+        # (start_new_session took effect). If not, the killpg guards in
+        # cmd_stop / _force_kill_all_running / crash-recovery will correctly
+        # decline to killpg (falling back to _kill_pid_and_children), so the
+        # session is safe — but the job's group then can't be reaped as a unit.
+        # A future hardening could warn + re-launch without setsid failure.
         proc = subprocess.Popen(job["cmd"], shell=True, cwd=cwd,
                                 start_new_session=True, env=env,
                                 stdout=log_f, stderr=log_f)
@@ -470,12 +542,27 @@ def _force_kill_all_running() -> None:
     orphan the real command; SIGKILL each group via os.killpg. Extracted to a
     module-level helper so it is unit-testable without delivering real signals.
     """
+    # SAFETY: same guard as cmd_stop / _run_embedded_bash — only killpg a group
+    # we've confirmed is the job's OWN (start_new_session made pgid == pid) and
+    # NOT gq's own group. If setsid didn't take effect, fall back to killing the
+    # job pid only. Never SIGKILL gq's group (would kill the terminal/tmux/all
+    # sibling processes — a real incident this code path previously caused).
+    my_pgid = os.getpgid(0)
     for rid, info in list(_running.items()):
         pid = info["proc"].pid
         try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            child_pgid = os.getpgid(pid)
+        except (ProcessLookupError, OSError):
+            continue
+        if (child_pgid == pid and child_pgid != my_pgid and child_pgid > 0):
+            try:
+                os.killpg(child_pgid, signal.SIGKILL)
+                continue
+            except (ProcessLookupError, OSError):
+                pass
+        # Groups coincide or look unsafe — kill the job pid AND its direct
+        # children, WITHOUT killpg so gq's own group is never hit.
+        _kill_pid_and_children(pid)
 
 
 def _daemon_loop(poll_interval: int) -> None:
@@ -604,22 +691,43 @@ def cmd_watch(args) -> None:
             alive = False
             if rpid:
                 try:
-                    # Job runs in its own session/group (start_new_session=True),
-                    # so getpgid(rpid) == rpid. Check liveness via the group.
-                    os.killpg(os.getpgid(rpid), 0)
+                    # Check liveness of the pid directly (NOT via killpg(group,0),
+                    # which could touch an unrelated group if the pid was recycled).
+                    os.kill(rpid, 0)
                     alive = True
                 except ProcessLookupError:
                     pass
-                except (TypeError, PermissionError):
+                except (TypeError, PermissionError, OSError):
                     pass  # pid None/non-int or not ours — treat as stale
             if alive:
-                print(f"[gq] WARNING: orphaned job {rid} (pid {rpid}) still running "
-                      "from a previous daemon crash; killing its process group.",
-                      file=sys.stderr)
+                # SAFETY: rpid comes from a PREVIOUS daemon's state file, so it may
+                # have been recycled to an unrelated process (terminal/tmux/etc).
+                # Only killpg if the group is the pid's OWN (pgid == pid, i.e. it's
+                # still a session leader as start_new_session made it) and is NOT
+                # gq's own group. Otherwise DO NOT kill — warn the user instead,
+                # since killing a recycled pid's group could SIGKILL the session.
+                my_pgid = os.getpgid(0)
+                safe_to_killpg = False
                 try:
-                    os.killpg(os.getpgid(rpid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                    child_pgid = os.getpgid(rpid)
+                    safe_to_killpg = (child_pgid == rpid
+                                      and child_pgid != my_pgid
+                                      and child_pgid > 0)
+                except (ProcessLookupError, OSError):
+                    safe_to_killpg = False
+                if safe_to_killpg:
+                    print(f"[gq] WARNING: orphaned job {rid} (pid {rpid}) still running "
+                          "from a previous daemon crash; killing its process group.",
+                          file=sys.stderr)
+                    try:
+                        os.killpg(child_pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                else:
+                    print(f"[gq] WARNING: orphaned job {rid} (pid {rpid}) is alive but "
+                          "its process group can't be confirmed safe (pid may have been "
+                          "recycled). NOT auto-killing — inspect pid {rpid} manually.",
+                          file=sys.stderr)
             else:
                 print(f"[gq] WARNING: stale running entry for job {rid} "
                       "cleared (process no longer running).", file=sys.stderr)

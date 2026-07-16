@@ -365,26 +365,52 @@ def test_cmd_stop_no_running_job(capsys):
 
 
 def test_cmd_stop_kills_running_job(monkeypatch, capsys):
-    """gq stop SIGKILLs the running job's process group via its pid."""
+    """gq stop SIGKILLs the running job's process group — but ONLY when the
+    three-way guard confirms the group is the child's own (pgid==pid) and
+    distinct from gq's group. Here pgid==pid==12345, distinct from gq (0=1),
+    so killpg(12345) fires."""
     gq.write_state({"daemon_pid": None,
                     "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": 12345}}})
-    calls = {"getpgid": None, "killpg": None}
-
+    calls = {"getpgid": [], "killpg": None}
+    # pgid(12345) == 12345 (setsid worked); pgid(0) == 1 (gq's own group).
     def fake_getpgid(pid):
-        calls["getpgid"] = pid
-        return 99999  # the process group id
-
-    def fake_killpg(pgid, sig):
-        calls["killpg"] = (pgid, sig)
-
+        calls["getpgid"].append(pid)
+        return 12345 if pid == 12345 else 1
+    killed = []
     monkeypatch.setattr(gq.os, "getpgid", fake_getpgid)
-    monkeypatch.setattr(gq.os, "killpg", fake_killpg)
+    monkeypatch.setattr(gq.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    # _kill_pid_and_children must NOT be reached (killpg path taken); stub it
+    # so we can assert it wasn't called.
+    fallback_called = []
+    monkeypatch.setattr(gq, "_kill_pid_and_children",
+                        lambda pid: fallback_called.append(pid))
     gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
-    assert calls["getpgid"] == 12345
-    assert calls["killpg"] == (99999, signal.SIGKILL)
+    assert killed == [(12345, signal.SIGKILL)], f"killpg should fire: {killed}"
+    assert fallback_called == [], "fallback must NOT run when killpg guard passes"
     assert "stopped job ab12" in out
     assert "12345" in out
+
+
+def test_cmd_stop_fallback_when_group_unsafe(monkeypatch, capsys):
+    """When the child's pgid != pid (setsid failed) or == gq's group, killpg
+    is DECLINED and _kill_pid_and_children (pid + children, no killpg) runs
+    instead — never SIGKILL gq's own group."""
+    gq.write_state({"daemon_pid": None,
+                    "running": {"ab12": {"id": "ab12", "cmd": "x", "pid": 12345}}})
+    # pgid(12345) == 1 == pgid(0): child shares gq's group → guard declines.
+    monkeypatch.setattr(gq.os, "getpgid", lambda pid: 1)
+    killpg_calls = []
+    monkeypatch.setattr(gq.os, "killpg",
+                        lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    fallback_called = []
+    monkeypatch.setattr(gq, "_kill_pid_and_children",
+                        lambda pid: fallback_called.append(pid))
+    gq.cmd_stop(_args(job_id="ab12"))
+    out = capsys.readouterr().out
+    assert killpg_calls == [], f"killpg must NOT fire on shared group: {killpg_calls}"
+    assert fallback_called == [12345], "fallback must run when guard declines"
+    assert "stopped job ab12" in out
 
 
 def test_cmd_stop_pid_already_dead(monkeypatch, capsys):
@@ -1166,13 +1192,16 @@ def test_cmd_stop_stops_named_job(monkeypatch, capsys):
         "cd34": {"id": "cd34", "cmd": "y", "pid": 222, "cards": [1], "n": 1},
     }})
     killed = []
-    monkeypatch.setattr(gq.os, "getpgid", lambda pid: pid * 10)
+    # pgid(111)==111 (setsid worked, pgid==pid), pgid(0)==1 (gq's group, distinct).
+    # So the guard passes for ab12 and killpg(111) fires; cd34 is untouched.
+    monkeypatch.setattr(gq.os, "getpgid", lambda pid: 1 if pid == 0 else pid)
     monkeypatch.setattr(gq.os, "killpg",
                         lambda pgid, sig: killed.append(pgid))
+    monkeypatch.setattr(gq, "_kill_pid_and_children", lambda pid: None)
     gq.cmd_stop(_args(job_id="ab12"))
     out = capsys.readouterr().out
     assert "stopped job ab12" in out
-    assert killed == [1110]  # only ab12's group (111*10), not cd34's
+    assert killed == [111]  # only ab12's group (pgid==pid==111), not cd34's
 
 
 def test_cmd_stop_unknown_id(capsys):
@@ -1658,3 +1687,45 @@ def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_pat
     gq._run_embedded_bash(MockWin(), oy=2, ox=0)
     # Child's group (5) is distinct from gq's (7) and pgid==pid → killpg(5, SIGKILL).
     assert killpg_calls == [(5, signal.SIGKILL)], f"unexpected killpg: {killpg_calls}"
+
+
+def test_kill_pid_and_children_kills_pid_and_descendants(monkeypatch):
+    """_kill_pid_and_children SIGKILLs the pid + its direct children (PPID==pid)
+    by walking /proc/*/stat — WITHOUT killpg. /proc/<pid>/stat format is
+    "pid (comm) state ppid ..." where comm may contain spaces/parens, so the
+    parser must split from the LAST ')'.
+    """
+    killed = []
+    # Fake /proc: pids 100 (the target, PPID=1), 200/201 (children, PPID=100),
+    # 300 (unrelated, PPID=1), 400 (child with parens in comm, PPID=100).
+    proc_stat = {
+        "100": "100 (python3.8) R 1 ...\n",
+        "200": "200 (train.py) R 100 ...\n",
+        "201": "201 (sub proc) R 100 ...\n",
+        "300": "300 (other) R 1 ...\n",
+        "400": "400 (my (weird) name) R 100 ...\n",
+    }
+    class FakeFile:
+        def __init__(self, content): self._c = content
+        def read(self): return self._c
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    import builtins
+    real_open = builtins.open
+    def fake_open(path, *a, **kw):
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+            pid = path.split("/")[2]
+            return FakeFile(proc_stat.get(pid, ""))
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "listdir", lambda d: list(proc_stat.keys()) if d == "/proc" else [])
+
+    gq._kill_pid_and_children(100)
+    killed_pids = {pid for pid, sig in killed}
+    assert 100 in killed_pids, "must kill the target pid"
+    assert 200 in killed_pids and 201 in killed_pids, "must kill children"
+    assert 400 in killed_pids, "must handle parens-in-comm (split from last ')')"
+    assert 300 not in killed_pids, "must not kill unrelated pids"
+    assert all(sig == signal.SIGKILL for _, sig in killed)
