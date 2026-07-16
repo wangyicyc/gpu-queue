@@ -1387,9 +1387,33 @@ def _run_embedded_bash(stdscr, oy, ox):
                     pass
                 _c.doupdate()
                 dirty = False
-            # 3. Get a key (blocking, ~0.2s timeout to re-read bash output).
-            _c.halfdelay(2)  # 0.2s tick — snappier streaming than 1s
-            ch = stdscr.getch()
+            # 3. Get a key. Use nodelay (non-blocking) + a short sleep poll
+            # instead of halfdelay, because halfdelay makes getch wait ~1s on
+            # Esc (0x1b) to distinguish it from function-key escape sequences —
+            # that 1s Esc delay is the main source of "Esc feels slow".
+            # nodelay returns each byte immediately; we poll every 5ms so bash
+            # output is still read promptly.
+            stdscr.nodelay(True)
+            ch = -1
+            while True:
+                ch = stdscr.getch()
+                if ch != -1:
+                    break
+                # No key yet — check for bash output, then sleep briefly.
+                r, _, _ = select.select([master], [], [], 0)
+                if r:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError:
+                        data = b""
+                    if data:
+                        stream.feed(data.decode("utf-8", "replace"))
+                        got_output = True
+                        dirty = True
+                if got_output:
+                    break  # redraw with new bash output, then poll for key again
+                time.sleep(0.005)  # 5ms poll interval
+            stdscr.nodelay(False)
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
             if ch == _c.KEY_F5:
@@ -1456,9 +1480,6 @@ def _run_embedded_bash(stdscr, oy, ox):
     finally:
         # Leave raw mode and return to cbreak (what the main TUI loop expects),
         # then hide the cursor again (the main TUI loop uses curs_set(0)).
-        # Guard each: mocked tests run without initscr(), and some terminals
-        # reject these; a raise here must not mask the original try-body error
-        # or skip the remaining cleanup (master close, killpg, temp unlink).
         try:
             _c.noraw()
             _c.cbreak()
@@ -1481,9 +1502,7 @@ def _run_embedded_bash(stdscr, oy, ox):
         if (child_pgid is not None
                 and child_pgid != my_pgid
                 and child_pgid > 0
-                and child_pgid != proc.pid + 1):  # extra guard; never a near-pid group
-            # SAFETY: only killpg a group we've confirmed is the CHILD's own
-            # session (setsid made bash a group leader, so pgid == child pid).
+                and child_pgid != proc.pid + 1):
             if child_pgid == proc.pid:
                 try:
                     os.killpg(child_pgid, signal.SIGKILL)
@@ -1491,7 +1510,6 @@ def _run_embedded_bash(stdscr, oy, ox):
                 except (ProcessLookupError, OSError):
                     pass
         if not killed_group:
-            # Groups coincide or look unsafe — kill bash only, never gq's group.
             try:
                 proc.kill()
             except Exception:
@@ -1499,7 +1517,7 @@ def _run_embedded_bash(stdscr, oy, ox):
         try:
             proc.wait(timeout=1.0)
         except Exception:
-            pass  # timeout or already dead — don't block the TUI on bash cleanup
+            pass
         try:
             os.close(master)
         except OSError:
