@@ -1384,7 +1384,7 @@ def _run_embedded_bash(stdscr, oy, ox):
                 # Bottom hint on stdscr (outside the dialog subwindow).
                 try:
                     stdscr.addstr(h - 1, 0,
-                                  " F5 submit  Esc cancel  Ctrl-C interrupts test-run "[:w - 1],
+                                  " F5 submit  Esc cancel  Ctrl-C interrupt  |  Tab: complete  Ctrl-R: search history  ↑↓: history "[:w - 1],
                                   _c.color_pair(4))
                 except _c.error:
                     pass
