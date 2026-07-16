@@ -1340,10 +1340,14 @@ def _run_embedded_bash(stdscr, oy, ox):
         # is idle, blocking getch and making typing feel laggy.
         dirty = True  # draw once on entry
         while True:
-            # 1. Non-blocking read bash output, feed pyte.
+            # 1. Read bash output, feed pyte. Use a small select timeout (5ms)
+            # instead of 0 so bash has time to echo the key we just forwarded —
+            # without this, the echo arrives on the NEXT halfdelay cycle (0.2s
+            # later), making typing feel laggy (the char doesn't appear until
+            # 160-200ms after the keypress).
             got_output = False
             while True:
-                r, _, _ = select.select([master], [], [], 0)
+                r, _, _ = select.select([master], [], [], 0.005)
                 if not r:
                     break
                 try:
