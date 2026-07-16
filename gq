@@ -817,22 +817,21 @@ def _safe_addstr(stdscr, y, x, s, attr=curses.A_NORMAL):
         pass
 
 
-def _gpu_summary_line():
-    """One-line GPU overview for the top bar."""
-    total = _total_cards()
-    busy = busy_cards()
-    state = read_state()
-    nrun = len(state.get("running") or {})
-    nq = len(read_queue())
+def _gpu_summary_line(total, busy, nrun, nq):
+    """One-line GPU overview for the top bar. Takes pre-read values so the
+    caller can share a single nvidia-smi read across the whole render cycle
+    (busy_cards / _gpu_utilization are expensive subprocess calls)."""
     clock = datetime.datetime.now().strftime("%H:%M:%S")
     idle = total - len(busy)
     return f" gq  {total} GPUs ({idle} idle)  {nrun} running  {nq} queued   {clock}"
 
 
-def _render_panel(stdscr, rows, focus, gpu_summary):
+def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
     """Render the TUI: top summary + per-GPU utilization bars + operations
     list + bottom hint. Uses noutrefresh (caller runs doupdate) for flicker-
-    free updates.
+    free updates. Takes pre-read total/utils/busy/state so the caller does
+    ONE nvidia-smi read per cycle (busy_cards + _gpu_utilization), shared
+    with _gpu_summary_line — instead of each rendering helper re-querying.
     """
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -844,10 +843,6 @@ def _render_panel(stdscr, rows, focus, gpu_summary):
                  curses.color_pair(CYAN) | curses.A_BOLD)
 
     # Per-GPU utilization bars (one line per GPU)
-    total = _total_cards()
-    utils = _gpu_utilization()
-    busy = busy_cards()
-    state = read_state()
     running = state.get("running") or {}
     # Map each card index -> (job_id, running_job_dict) that owns it.
     card_to_job = {}
@@ -1086,12 +1081,21 @@ def _tui_main(stdscr):
     curses.halfdelay(20)  # 2-second refresh tick; keys return immediately
     focus = 0
     while True:
+        # Read state/queue/GPU ONCE per cycle and share across helpers:
+        # busy_cards() and _gpu_utilization() each spawn nvidia-smi, so
+        # calling them inside both _gpu_summary_line AND _render_panel would
+        # double the nvidia-smi load per refresh.
         state = read_state()
         queue = read_queue()
+        total = _total_cards()
+        busy = busy_cards()
+        utils = _gpu_utilization()
         rows = _build_rows(state, queue)
         if focus >= len(rows):
             focus = max(0, len(rows) - 1)
-        _render_panel(stdscr, rows, focus, _gpu_summary_line())
+        nrun = len(state.get("running") or {})
+        summary = _gpu_summary_line(total, busy, nrun, len(queue))
+        _render_panel(stdscr, rows, focus, summary, total, utils, busy, state)
         curses.doupdate()
         ch = stdscr.getch()
         if ch in (curses.KEY_UP, ord("k")):
