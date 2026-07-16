@@ -1333,8 +1333,15 @@ def _run_embedded_bash(stdscr, oy, ox):
             win = stdscr.subwin(dh, dw, oy, ox)
         except _c.error:
             win = stdscr
+        # Only redraw when something changed (bash output arrived or a key was
+        # pressed). Redrawing every cycle even when nothing changed is the main
+        # source of input lag — the per-cell _render_pyte_to_dialog traversal
+        # (784+ cells for a 14×56 dialog) runs every 0.2s even if the screen
+        # is idle, blocking getch and making typing feel laggy.
+        dirty = True  # draw once on entry
         while True:
             # 1. Non-blocking read bash output, feed pyte.
+            got_output = False
             while True:
                 r, _, _ = select.select([master], [], [], 0)
                 if not r:
@@ -1346,43 +1353,41 @@ def _run_embedded_bash(stdscr, oy, ox):
                 if not data:
                     break
                 stream.feed(data.decode("utf-8", "replace"))
-            # 2. Render the dialog — erase only the subwindow (not the whole
-            # stdscr), redraw border + pyte content. Using noutrefresh +
-            # doupdate (batched, no flicker) instead of refresh.
-            try:
-                win.erase()
-                win.box()
-                win.addstr(0, 2, " compose (F5 submit, Esc cancel) ",
-                           _c.A_BOLD)
-                _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2)
-                win.noutrefresh()
-            except _c.error:
-                pass
-            # Bottom hint on stdscr (outside the dialog subwindow).
-            try:
-                stdscr.addstr(h - 1, 0,
-                              " F5 submit  Esc cancel  Ctrl-C interrupts test-run "[:w - 1],
-                              _c.color_pair(4))
-            except _c.error:
-                pass
-            stdscr.noutrefresh()
-            # Move the cursor to pyte's cursor position AFTER all noutrefresh
-            # calls (stdscr.noutrefresh above resets the cursor to wherever
-            # stdscr's last addstr left it, i.e. the bottom hint line). Only
-            # by moving AFTER noutrefresh and BEFORE doupdate does the cursor
-            # appear at the user's typing position. The +1 offsets account for
-            # the dialog's 1-cell border.
-            try:
-                cx = min(getattr(screen.cursor, "x", 0), dw - 2)
-                cy = min(getattr(screen.cursor, "y", 0), dh - 2)
-                stdscr.move(oy + 1 + cy, ox + 1 + cx)
-            except _c.error:
-                pass
-            _c.doupdate()
-
+                got_output = True
+            # 2. Render the dialog ONLY if dirty (new output or key pressed).
+            if got_output or dirty:
+                try:
+                    win.erase()
+                    win.box()
+                    win.addstr(0, 2, " compose (F5 submit, Esc cancel) ",
+                               _c.A_BOLD)
+                    _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2)
+                    win.noutrefresh()
+                except _c.error:
+                    pass
+                # Bottom hint on stdscr (outside the dialog subwindow).
+                try:
+                    stdscr.addstr(h - 1, 0,
+                                  " F5 submit  Esc cancel  Ctrl-C interrupts test-run "[:w - 1],
+                                  _c.color_pair(4))
+                except _c.error:
+                    pass
+                stdscr.noutrefresh()
+                # Move the cursor to pyte's cursor position AFTER all
+                # noutrefresh, BEFORE doupdate (see comment above).
+                try:
+                    cx = min(getattr(screen.cursor, "x", 0), dw - 2)
+                    cy = min(getattr(screen.cursor, "y", 0), dh - 2)
+                    stdscr.move(oy + 1 + cy, ox + 1 + cx)
+                except _c.error:
+                    pass
+                _c.doupdate()
+                dirty = False
             # 3. Get a key (blocking, ~0.2s timeout to re-read bash output).
             _c.halfdelay(2)  # 0.2s tick — snappier streaming than 1s
             ch = stdscr.getch()
+            if ch != -1:
+                dirty = True  # a key was pressed → redraw next cycle
             if ch == _c.KEY_F5:
                 # Forward F5 (\e[15~) to bash so the rcfile's `bind -x`
                 # fires __gq_capture, which writes the temp files (cmd, then
