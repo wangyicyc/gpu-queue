@@ -1504,6 +1504,11 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
     import tempfile as _tf
     monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
     monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+    # CRITICAL: mock os.getpgid/os.killpg so the finally teardown does NOT call
+    # the real killpg(getpgid(1)) — proc.pid is 1 (mock), getpgid(1)=1 (init's
+    # group), and a real killpg(1, SIGKILL) would kill the whole session.
+    monkeypatch.setattr(_os, "getpgid", lambda pid: 999)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: None)
 
     class MockWin:
         def __init__(self): self.k = [gq.curses.KEY_F5]
@@ -1556,6 +1561,11 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
     import tempfile as _tf
     monkeypatch.setattr(_tf, "mkstemp", fake_mkstemp)
     monkeypatch.setattr(_sig, "signal", lambda *a: _sig.SIG_DFL)
+    # CRITICAL: mock os.getpgid/os.killpg so the finally teardown does NOT call
+    # the real killpg(getpgid(1)) — proc.pid is 1 (mock), getpgid(1)=1 (init's
+    # group), and a real killpg(1, SIGKILL) would kill the whole session.
+    monkeypatch.setattr(_os, "getpgid", lambda pid: 999)
+    monkeypatch.setattr(_os, "killpg", lambda pgid, sig: None)
 
     class MockWin:
         def getmaxyx(self): return (24, 80)
