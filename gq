@@ -903,9 +903,18 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
         _safe_addstr(stdscr, y, PAD, label, attr)
         y += 2
 
-    # Bottom hint
-    _safe_addstr(stdscr, h - 1, PAD,
-                 " ↑↓ select  Enter confirm  q quit  |  Add: compose in bash, F5 submit, Esc cancel "[:w - 1 - PAD],
+    # Bottom hint — context-sensitive: shows guidance for the focused row
+    hints = {
+        "add": " Enter: open bash, type command, F5 to submit, Esc to cancel ",
+        "stop": " Enter: stop this running job (daemon stays alive) ",
+        "cancel": " Enter: remove this queued job from the queue ",
+        "clear": " Enter: clear all queued jobs (running jobs unaffected) ",
+        "open_log": " Enter: view this job's output log tail ",
+        "quit": " Enter: exit the TUI (daemon keeps running) ",
+    }
+    focused_action = rows[focus].get("action", "") if 0 <= focus < len(rows) else ""
+    hint = hints.get(focused_action, " ↑↓ select  Enter confirm  q quit ")
+    _safe_addstr(stdscr, h - 1, PAD, hint[:w - 1 - PAD],
                  curses.color_pair(CYAN))
 
     stdscr.noutrefresh()
