@@ -905,7 +905,7 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
 
     # Bottom hint
     _safe_addstr(stdscr, h - 1, PAD,
-                 " Up/Dn select  Enter confirm  q quit "[:w - 1 - PAD],
+                 " ↑↓ select  Enter confirm  q quit  |  Add: compose in bash, F5 submit, Esc cancel "[:w - 1 - PAD],
                  curses.color_pair(CYAN))
 
     stdscr.noutrefresh()
