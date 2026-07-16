@@ -1080,24 +1080,33 @@ def _tui_main(stdscr):
     stdscr.keypad(True)
     curses.halfdelay(20)  # 2-second refresh tick; keys return immediately
     focus = 0
+    # Cache the expensive nvidia-smi reads (busy_cards / _gpu_utilization) and
+    # only REFRESH them on the halfdelay timeout (every 2s), NOT on every
+    # keystroke. Before this, each keypress waited for 2 nvidia-smi subprocess
+    # calls (up to ~10s each on a hung driver) before the next key was read —
+    # making the TUI feel laggy. Now keys respond instantly from cache; the
+    # GPU bars update at most 2s late, which is fine for a status display.
+    # state/queue are cheap (file reads) so they're read every cycle.
+    cached_total = _total_cards()
+    cached_busy = busy_cards()
+    cached_utils = _gpu_utilization()
     while True:
-        # Read state/queue/GPU ONCE per cycle and share across helpers:
-        # busy_cards() and _gpu_utilization() each spawn nvidia-smi, so
-        # calling them inside both _gpu_summary_line AND _render_panel would
-        # double the nvidia-smi load per refresh.
         state = read_state()
         queue = read_queue()
-        total = _total_cards()
-        busy = busy_cards()
-        utils = _gpu_utilization()
         rows = _build_rows(state, queue)
         if focus >= len(rows):
             focus = max(0, len(rows) - 1)
         nrun = len(state.get("running") or {})
-        summary = _gpu_summary_line(total, busy, nrun, len(queue))
-        _render_panel(stdscr, rows, focus, summary, total, utils, busy, state)
+        summary = _gpu_summary_line(cached_total, cached_busy, nrun, len(queue))
+        _render_panel(stdscr, rows, focus, summary, cached_total, cached_utils,
+                      cached_busy, state)
         curses.doupdate()
         ch = stdscr.getch()
+        if ch == -1:
+            # halfdelay timeout — refresh the expensive nvidia-smi cache.
+            cached_busy = busy_cards()
+            cached_utils = _gpu_utilization()
+            continue
         if ch in (curses.KEY_UP, ord("k")):
             focus = max(0, focus - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
@@ -1109,7 +1118,7 @@ def _tui_main(stdscr):
                 done = _tui_do_action(stdscr, rows[focus], focus)
                 if done:
                     break
-        # any other key / timeout: just re-render on next cycle
+        # any other key: just re-render on next cycle (cheap, from cache)
 
 
 def _key_to_bytes(ch: int):
