@@ -1387,33 +1387,15 @@ def _run_embedded_bash(stdscr, oy, ox):
                     pass
                 _c.doupdate()
                 dirty = False
-            # 3. Get a key. Use nodelay (non-blocking) + a short sleep poll
-            # instead of halfdelay, because halfdelay makes getch wait ~1s on
-            # Esc (0x1b) to distinguish it from function-key escape sequences —
-            # that 1s Esc delay is the main source of "Esc feels slow".
-            # nodelay returns each byte immediately; we poll every 5ms so bash
-            # output is still read promptly.
-            stdscr.nodelay(True)
-            ch = -1
-            while True:
-                ch = stdscr.getch()
-                if ch != -1:
-                    break
-                # No key yet — check for bash output, then sleep briefly.
-                r, _, _ = select.select([master], [], [], 0)
-                if r:
-                    try:
-                        data = os.read(master, 4096)
-                    except OSError:
-                        data = b""
-                    if data:
-                        stream.feed(data.decode("utf-8", "replace"))
-                        got_output = True
-                        dirty = True
-                if got_output:
-                    break  # redraw with new bash output, then poll for key again
-                time.sleep(0.005)  # 5ms poll interval
-            stdscr.nodelay(False)
+            # 3. Get a key. keypad(False) disables curses' escape-sequence
+            # interpretation, so 0x1b (Esc) returns IMMEDIATELY as 27 instead
+            # of waiting ~1s to disambiguate from function-key sequences.
+            # The Add dialog only needs printable chars + Esc + Ctrl-C, not
+            # arrow keys / F-keys, so losing keypad is fine.
+            stdscr.keypad(False)
+            _c.halfdelay(1)  # 0.1s timeout — reads bash output promptly
+            ch = stdscr.getch()
+            stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
             if ch == _c.KEY_F5:

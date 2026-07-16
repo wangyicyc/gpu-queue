@@ -1465,6 +1465,7 @@ def test_render_pyte_to_dialog_draws_buffer():
         def refresh(self): pass
         def noutrefresh(self): pass
         def nodelay(self, flag): pass
+        def keypad(self, flag): pass
     std = MockStd()
     gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
     # The 'A' at buffer[(0,0)] should be drawn at curses (oy+0, ox+0) = (2,5).
@@ -1523,6 +1524,7 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
         def refresh(self): pass
         def noutrefresh(self): pass
         def nodelay(self, flag): pass
+        def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1582,6 +1584,7 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
         def refresh(self): pass
         def noutrefresh(self): pass
         def nodelay(self, flag): pass
+        def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1645,6 +1648,7 @@ def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
         def refresh(self): pass
         def noutrefresh(self): pass
         def nodelay(self, flag): pass
+        def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
@@ -1701,6 +1705,7 @@ def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_pat
         def refresh(self): pass
         def noutrefresh(self): pass
         def nodelay(self, flag): pass
+        def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
