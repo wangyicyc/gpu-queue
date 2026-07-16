@@ -1464,7 +1464,7 @@ def test_render_pyte_to_dialog_draws_buffer():
         def move(self, *a): pass
         def refresh(self): pass
         def noutrefresh(self): pass
-        def nodelay(self, flag): pass
+        def nodelay(self, flag): self._nodelay = flag
         def keypad(self, flag): pass
     std = MockStd()
     gq._render_pyte_to_dialog(std, screen, oy=2, ox=5, dh=1, dw=10)
@@ -1517,13 +1517,13 @@ def test_run_embedded_bash_f5_submit(monkeypatch, tmp_path):
     monkeypatch.setattr(_os, "killpg", lambda pgid, sig: None)
 
     class MockWin:
-        def __init__(self): self.k = [gq.curses.KEY_F5]
+        def __init__(self): self.k = [gq.curses.KEY_F5]; self._nodelay = False
         def getmaxyx(self): return (24, 80)
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
         def noutrefresh(self): pass
-        def nodelay(self, flag): pass
+        def nodelay(self, flag): self._nodelay = flag
         def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
@@ -1578,17 +1578,21 @@ def test_run_embedded_bash_esc_cancel(monkeypatch, tmp_path):
     monkeypatch.setattr(_os, "killpg", lambda pgid, sig: None)
 
     class MockWin:
+        def __init__(self): self._nodelay = False; self._peeked = False
         def getmaxyx(self): return (24, 80)
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
         def noutrefresh(self): pass
-        def nodelay(self, flag): pass
+        def nodelay(self, flag): self._nodelay = flag
         def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
         def getch(self):
+            if self._nodelay and self._peeked:
+                return -1  # no more bytes (nodelay peek after first byte)
+            self._peeked = True
             return 27  # Esc
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
@@ -1642,17 +1646,21 @@ def test_run_embedded_bash_never_killpg_own_group(monkeypatch, tmp_path):
     proc.kill = lambda: kill_calls.append("kill")
 
     class MockWin:
+        def __init__(self): self._nodelay = False; self._peeked = False
         def getmaxyx(self): return (24, 80)
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
         def noutrefresh(self): pass
-        def nodelay(self, flag): pass
+        def nodelay(self, flag): self._nodelay = flag
         def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
         def getch(self):
+            if self._nodelay and self._peeked:
+                return -1  # no more bytes (nodelay peek after first byte)
+            self._peeked = True
             return 27  # Esc → triggers the finally cleanup
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)
@@ -1699,17 +1707,21 @@ def test_run_embedded_bash_killpg_child_group_when_distinct(monkeypatch, tmp_pat
     monkeypatch.setattr(_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
 
     class MockWin:
+        def __init__(self): self._nodelay = False; self._peeked = False
         def getmaxyx(self): return (24, 80)
         def box(self): pass
         def addstr(self, *a, **kw): pass
         def refresh(self): pass
         def noutrefresh(self): pass
-        def nodelay(self, flag): pass
+        def nodelay(self, flag): self._nodelay = flag
         def keypad(self, flag): pass
         def erase(self): pass
         def move(self, *a): pass
         def subwin(self, *a): return self
         def getch(self):
+            if self._nodelay and self._peeked:
+                return -1  # no more bytes (nodelay peek after first byte)
+            self._peeked = True
             return 27  # Esc
     monkeypatch.setattr(gq, "_tui_blocking_mode", lambda s: None)
     monkeypatch.setattr(gq, "_tui_restore_halfdelay", lambda s: None)

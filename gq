@@ -1399,14 +1399,38 @@ def _run_embedded_bash(stdscr, oy, ox):
                     pass
                 _c.doupdate()
                 dirty = False
-            # 3. Get a key. keypad(False) disables curses' escape-sequence
-            # interpretation, so 0x1b (Esc) returns IMMEDIATELY as 27 instead
-            # of waiting ~1s to disambiguate from function-key sequences.
-            # The Add dialog only needs printable chars + Esc + Ctrl-C, not
-            # arrow keys / F-keys, so losing keypad is fine.
+            # 3. Get a key. keypad(False) makes 0x1b (Esc) return immediately
+            # as 27 (no 1s curses disambiguation wait). BUT arrow keys also
+            # start with 0x1b — so on seeing 27 we do a quick nodelay peek:
+            # if there's a follow-up byte ([, O, etc.) it's an escape sequence
+            # (arrow key, Home, etc.) → forward the whole thing to bash; if
+            # there's nothing following, it's a real Esc → cancel.
             stdscr.keypad(False)
             _c.halfdelay(1)  # 0.1s timeout — reads bash output promptly
             ch = stdscr.getch()
+            if ch == 27:
+                # Possible Esc OR start of an escape sequence (arrow keys etc).
+                # Peek at the next byte with a tiny timeout to disambiguate.
+                stdscr.nodelay(True)
+                time.sleep(0.01)  # 10ms — enough for the rest of the seq
+                ch2 = stdscr.getch()
+                if ch2 != -1:
+                    # It's an escape sequence, not Esc. Forward \x1b + ch2
+                    # (+ any more bytes) to bash so readline handles arrows.
+                    seq = b"\x1b" + bytes([ch2])
+                    # Read any remaining bytes of the sequence (e.g. [A = 3 bytes)
+                    while True:
+                        ch3 = stdscr.getch()
+                        if ch3 == -1:
+                            break
+                        seq += bytes([ch3])
+                    try:
+                        os.write(master, seq)
+                    except OSError:
+                        pass
+                    ch = -1  # not a real key for gq; just redraw
+                # else: real Esc, ch stays 27 → falls through to the Esc break
+                stdscr.nodelay(False)
             stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
