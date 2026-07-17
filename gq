@@ -1532,7 +1532,7 @@ def _run_embedded_bash(stdscr, oy, ox):
             # 160-200ms after the keypress).
             got_output = False
             while True:
-                r, _, _ = select.select([master], [], [], 0.02)
+                r, _, _ = select.select([master], [], [], 0.05)
                 if not r:
                     break
                 try:
@@ -1588,7 +1588,12 @@ def _run_embedded_bash(stdscr, oy, ox):
             # (arrow key, Home, etc.) → forward the whole thing to bash; if
             # there's nothing following, it's a real Esc → cancel.
             stdscr.keypad(False)
-            _c.halfdelay(1)  # 0.1s timeout — reads bash output promptly
+            _c.halfdelay(1)  # 0.1s timeout
+            # NOTE: halfdelay(1) = 0.1s. In raw mode, getch returns -1 after
+            # 0.1s if no key. The loop then goes back to the top and drains
+            # bash output with a 20ms select. So async output (print/echo
+            # from a running command) is checked every ~0.12s — fast enough
+            # to feel live.
             # halfdelay() re-enters cbreak mode which restores ISIG, so
             # Ctrl-C would be intercepted by the tty (as SIGINT) instead of
             # reaching getch as \x03. Re-apply raw() AFTER halfdelay to clear
