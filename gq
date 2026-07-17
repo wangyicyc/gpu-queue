@@ -1577,6 +1577,34 @@ def _run_embedded_bash(stdscr, oy, ox):
             stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
+            # After forwarding a key to bash, drain its output and redraw
+            # immediately (don't wait for the next halfdelay cycle). Without
+            # this, Tab completion / command output doesn't appear until the
+            # user presses another key — because the forwarded key sets ch=-1
+            # (arrow seq) or ch=3 (Ctrl-C) which doesn't set dirty=True, so
+            # the next cycle's render is skipped.
+            kb = _key_to_bytes(ch) if ch != -1 else None
+            if kb is not None:
+                try:
+                    os.write(master, kb)
+                except OSError:
+                    pass
+                # Drain bash output (bash echoes the key + any completion/
+                # command output) with a short wait, then force a redraw.
+                deadline = time.monotonic() + 0.05  # 50ms max wait
+                while time.monotonic() < deadline:
+                    r, _, _ = select.select([master], [], [], 0.005)
+                    if not r:
+                        break
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        break
+                    stream.feed(data.decode("utf-8", "replace"))
+                    dirty = True  # force redraw with new bash output
+                continue  # redraw now, don't fall through to Enter/F5 handling
             # Ctrl-S (19) toggles mode (exec ↔ submit), like vim's mode switch.
             if ch == 19:
                 mode = "submit" if mode == "exec" else "exec"
@@ -1632,12 +1660,9 @@ def _run_embedded_bash(stdscr, oy, ox):
                 break
             if ch == 27:  # Esc
                 break
-            kb = _key_to_bytes(ch)
-            if kb is not None:
-                try:
-                    os.write(master, kb)
-                except OSError:
-                    break
+            # Key forwarding already handled above (with drain + immediate
+            # redraw). This was the OLD forwarding path — removed to avoid
+            # double-forwarding. Only bash-exit check remains here.
             # If bash exited (Ctrl-D in bash), drain remaining output then break.
             if proc.poll() is not None:
                 try:
