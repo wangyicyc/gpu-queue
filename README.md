@@ -39,7 +39,7 @@ pip install pyte
 
 ### 用法
 
-`gq` 是 daemon 模型：你常驻一个 `gq watch` 守护进程，它盯着 GPU；你从别的窗口用 `gq add` 把命令丢进队列。GPU 一空闲，daemon 自动拖下一个任务跑，一个接一个，直到队列清空。
+`gq` 的主要交互方式是 **TUI 可视化面板**——敲 `gq`（不带子命令）进入全屏面板，用方向键选操作、回车执行，不用打命令名。命令行子命令（`gq add`/`gq list`/`gq stop` 等）作为可选的快捷方式。
 
 > daemon 是前台常驻进程——关掉它所在终端，daemon 就会被杀。**tmux 不是必须的**：你开着终端不关就行；只有想关终端/断 SSH 后让任务继续跑，才需要 tmux（或 `nohup`）。
 
@@ -49,12 +49,52 @@ pip install pyte
 # 1) 起常驻 daemon（所有任务摘要打到这里）
 gq watch --poll 15
 
-# 2) 另开一个终端窗口，加任务
-gq add 'python train.py --seed 1'
-gq add 'python train.py --seed 2'
+# 2) 另开一个终端，敲 gq 进入 TUI 面板
+gq
 
-# 3) 看状态
-gq list
+# 3) 在 TUI 里：上下选 Add job → 回车 → 在嵌入式 bash 里打命令 → Ctrl-S 切到提交模式 → Enter 提交
+#    或直接按 F5 提交（不用切模式）
+```
+
+TUI 面板长这样：
+
+```
+    gq  1 GPUs (1 idle)  0 running  0 queued   14:32:07
+    ----------------------------------------------------------------------
+    GPU 0  ░░░░░░░░░░░░   0%
+
+    ▸ Add job
+      Stop running job  (none running)
+      Open log  (none running)
+      Cancel queued job  (queue empty)
+      Clear queue
+      Quit
+ ↑↓ select  Enter confirm  q quit  |  Add: compose in bash, F5 submit, Esc cancel
+```
+
+- 顶部：GPU 占用条（彩色，每 2 秒刷新）+ 运行中/队列数量
+- 中间：操作列表（上下方向键选，回车执行）
+- 底部：上下文敏感提示（光标在哪个命令就提示哪个）
+
+**Add job 对话框**（选中 Add job 回车后展开）：
+- 嵌入式 bash，可以 `cd`、Tab 补全、试跑命令
+- **EXEC 模式**（默认，绿色）：Enter 执行 bash 命令（cd/source/试跑）
+- **SUBMIT 模式**（Ctrl-S 切换，黄色）：Enter 提交命令给队列（不执行）
+- **F5** 始终提交（不管模式）
+- **Esc** 取消退出
+- **Ctrl-C** 中断试跑的命令
+
+### 命令行用法（可选）
+
+如果你更喜欢命令行，所有操作也都有子命令：
+
+```bash
+gq add 'python train.py --seed 1'          # 加任务（默认单卡）
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'  # 多卡
+gq list                                     # 看状态
+gq stop <id>                                # 停运行中任务
+gq cancel <id>                              # 取消排队任务
+gq clear                                    # 清空队列
 ```
 
 `gq list` 大致长这样：
@@ -71,54 +111,45 @@ gq list
 
 三段分别是：**正在跑的任务**（含已运行时长 + 环境名）、**待跑队列**（按顺序编号）、**daemon 状态**（running / stale pid / not running）。
 
-**多卡服务器：** 给任务指定要几张卡，gq 自动挑空闲卡分配。
+#### 多卡任务
+
+给任务指定要几张卡，gq 自动挑空闲卡分配：
 
 ```bash
-# 8 卡服务器：这个任务要 4 张卡
 gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'
 # gq 挑 4 张空闲卡，注入 CUDA_VISIBLE_DEVICES=0,2,5,7 后跑
 # 多个任务可同时在不同卡上并行跑
 
-# 不指定 --gpus → 默认单卡（会提示一句）
-gq add 'python eval.py'
+gq add 'python eval.py'    # 不指定 --gpus → 默认单卡
 ```
 
 #### 一个任务的生命周期
 
-1. **`gq add`** —— 命令进入 `queue.json` 待跑队列。同时**快照**你当前的 shell 环境（conda/venv、PATH 等）和工作目录。
+1. **Add** —— 命令进入 `queue.json` 待跑队列。同时**快照**你当前的 shell 环境（conda/venv、PATH 等）和工作目录。
 2. **等待** —— daemon 每 `--poll` 秒检查一次 GPU 是否空闲。
 3. **执行** —— 空闲后，daemon 从队首弹出任务，用快照的环境还原后跑（`Popen(env=...)`）。stdout/stderr 写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。
 4. **完成** —— 任务结束（exit 0 = DONE，非 0 = FAILED），daemon 清掉运行状态，继续拖下一个。
-5. **队列空** —— daemon 继续轮询，等你 `gq add` 新任务。
+5. **队列空** —— daemon 继续轮询，等你加新任务。
 
-### 带上你的 conda / venv 环境
+### 环境捕获（可选阅读）
 
-这是 `gq` 的关键能力：你 `add` 时激活了什么环境，任务就在什么环境里跑——而不是 daemon 自己的环境。
+`gq` 的关键能力：你 `add` 时激活了什么环境，任务就在什么环境里跑——而不是 daemon 自己的环境。
 
 ```bash
-# 激活你想用的环境
 conda activate myenv          # 或 source ~/.venvs/ml/bin/activate
-
-# 然后 add，gq 会自动记住这个环境
 gq add 'python train.py --seed 1'    # → 会在 myenv 里跑
 ```
 
-每个任务**各自**记住自己 `add` 时的环境，所以可以混排不同环境的任务：
+每个任务**各自**记住自己 `add` 时的环境，可以混排不同环境：
 
 ```bash
 conda activate torch200 && gq add 'python train.py --seed 1'
 conda activate torch210 && gq add 'python train.py --seed 2'
-# 两个任务会分别在 torch200 / torch210 里跑
 ```
 
-`gq list` 会在每个任务后显示环境名（优先 `CONDA_DEFAULT_ENV`，否则 venv 目录名）：
+`gq list` 会在每个任务后显示环境名（优先 `CONDA_DEFAULT_ENV`，否则 venv 目录名）。
 
-```
-  #1  3f1a  python train.py --seed 1  [torch200]
-  #2  a9c2  python train.py --seed 2  [torch210]
-```
-
-> 环境是 `add` 时刻的**快照**。之后 conda 环境路径变了不会自动更新——符合"用我 add 时的环境跑"的语义。
+> 环境是 `add` 时刻的**快照**。之后 conda 环境路径变了不会自动更新。
 > 环境快照（可能含 API key 等）会存到 `~/.gpu-queue/` 下，仅本机本用户可读。
 
 ### 命令详解
@@ -222,19 +253,6 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 >
 > **`gq add` 补全文件名时不带引号。** bash 不会在单引号内部触发补全，所以 `gq add 'python eval<Tab>'` 补不出来。简单命令直接不引号：`gq add python eval<Tab>` → `eval.py`。带多参数的命令需要引号时，先把文件名补全再套引号：`gq add train<Tab>` → 改成 `gq add 'python train.py --seed 1'`。
 
-### TUI 可视化面板（可选）
-
-直接敲 `gq`（不带子命令）进入一个全屏 TUI 面板，像 htop/ranger 那样用上下方向键选择操作、回车执行，不用打命令名：
-
-- **Add job** → 在 Add 行右侧展开一个嵌入式 bash 对话框（60% 高，尽量占满宽度），可以 cd、tab 补全、试跑命令；打好要排队的命令后按 **F5** 提交（不执行该命令），**Esc** 取消，**Ctrl-C** 中断正在试跑的命令。提交后选 `--gpus` 卡数入队。注意：嵌入式对话框不支持全屏 TUI 程序（ranger/vim/htop），需要这些请用命令行 `gq add`。
-- **Stop: <id>** / **Cancel: #<n> <id>** → 选中回车，确认后停/取消该任务。
-- **Clear queue** / **Quit** → 回车执行。
-- **Open log: <id>** → 查看该任务的输出日志尾部。
-
-面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。底部提示根据光标所在命令动态变化（如选中 Add 时提示 F5/Esc/Ctrl-C，选中 Stop 时提示"停掉运行中任务"）。`gq watch` 仍是起 daemon 的命令，任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
-
-> TUI 的 Add 功能依赖 pyte 库：`pip install pyte`（watch/命令行不需要）
-
 ### 测试
 
 ```bash
@@ -287,7 +305,7 @@ pip install pyte
 
 ### Usage
 
-`gq` is a daemon model: you keep a `gq watch` daemon running, and it watches the GPU; from another window you `gq add` commands to the queue. The moment the GPU is idle, the daemon launches the next job, one after another, until the queue drains.
+The primary way to use `gq` is the **TUI visualization panel** — typing bare `gq` opens a full-screen panel where you select operations with arrow keys and Enter, no command typing needed. CLI subcommands (`gq add`/`gq list`/`gq stop` etc.) are available as optional shortcuts.
 
 > The daemon is a foreground process — closing its terminal kills it. **tmux is not required**: just keep the terminal open; use tmux (or `nohup`) only if you want jobs to survive closing the terminal / dropping an SSH session.
 
@@ -297,12 +315,53 @@ pip install pyte
 # 1) Start the daemon (all job summaries land here)
 gq watch --poll 15
 
-# 2) Open another terminal, add jobs
-gq add 'python train.py --seed 1'
-gq add 'python train.py --seed 2'
+# 2) Open another terminal, type gq to enter the TUI panel
+gq
 
-# 3) Check status
-gq list
+# 3) In the TUI: arrow keys to select Add job → Enter → type command in the
+#    embedded bash → Ctrl-S to switch to submit mode → Enter to submit
+#    Or just press F5 to submit (no mode switch needed)
+```
+
+The TUI panel looks like:
+
+```
+    gq  1 GPUs (1 idle)  0 running  0 queued   14:32:07
+    ----------------------------------------------------------------------
+    GPU 0  ░░░░░░░░░░░░   0%
+
+    ▸ Add job
+      Stop running job  (none running)
+      Open log  (none running)
+      Cancel queued job  (queue empty)
+      Clear queue
+      Quit
+ ↑↓ select  Enter confirm  q quit  |  Add: compose in bash, F5 submit, Esc cancel
+```
+
+- Top: GPU utilization bars (colored, auto-refresh every 2s) + running/queued counts
+- Middle: operations list (arrow keys to select, Enter to run)
+- Bottom: context-sensitive hint (changes based on which row is focused)
+
+**Add job dialog** (select Add job + Enter):
+- Embedded bash — you can `cd`, Tab-complete, test-run commands
+- **EXEC mode** (default, green): Enter executes bash commands (cd/source/test-run)
+- **SUBMIT mode** (Ctrl-S to toggle, yellow): Enter submits the command to the queue
+- **F5** always submits (regardless of mode)
+- **Esc** cancels
+- **Ctrl-C** interrupts a test-run command
+
+### CLI usage (optional)
+
+If you prefer the command line, all operations have subcommands:
+
+```bash
+gq add 'python train.py --seed 1'          # add a job (default single card)
+gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'  # multi-GPU
+gq list                                     # show status
+gq stop <id>                                # stop a running job
+gq cancel <id>                              # cancel a queued job
+gq clear                                    # clear the queue
 ```
 
 `gq list` looks roughly like this:
@@ -319,35 +378,31 @@ gq list
 
 The three blocks are: the **running job** (with elapsed time + env name), the **pending queue** (numbered in order), and the **daemon status** (running / stale pid / not running).
 
-**Multi-GPU server:** tell a job how many cards it needs, and `gq` picks idle cards for it.
+#### Multi-GPU
+
+Tell a job how many cards it needs, and `gq` picks idle cards for it:
 
 ```bash
-# 8-GPU server: this job wants 4 cards
 gq add --gpus 4 'torchrun --nproc_per_node=4 train.py'
 # gq picks 4 idle cards, injects CUDA_VISIBLE_DEVICES=0,2,5,7, then runs
-# multiple jobs can run in parallel across different cards
 
-# no --gpus → defaults to a single card (prints a one-line notice)
-gq add 'python eval.py'
+gq add 'python eval.py'    # no --gpus → defaults to a single card
 ```
 
 #### A job's lifecycle
 
-1. **`gq add`** — the command enters the pending queue in `queue.json`. It also **snapshots** your current shell environment (conda/venv, PATH, …) and working directory.
+1. **Add** — the command enters the pending queue in `queue.json`. It also **snapshots** your current shell environment (conda/venv, PATH, …) and working directory.
 2. **Wait** — the daemon checks whether the GPU is idle every `--poll` seconds.
 3. **Run** — once idle, the daemon pops the head job and runs it with the snapshot's environment restored (`Popen(env=...)`). stdout/stderr go to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries).
 4. **Finish** — when the job exits (0 = DONE, non-zero = FAILED), the daemon clears the running state and moves to the next job.
-5. **Empty queue** — the daemon keeps polling, waiting for you to `gq add` more.
+5. **Empty queue** — the daemon keeps polling, waiting for you to add more.
 
-### Carry your conda / venv environment
+### Environment capture (optional reading)
 
-This is `gq`'s key capability: the environment you had active when you `add` is the environment the job runs in — not the daemon's own environment.
+`gq`'s key capability: the environment you had active when you `add` is the environment the job runs in — not the daemon's own environment.
 
 ```bash
-# Activate the env you want
 conda activate myenv          # or: source ~/.venvs/ml/bin/activate
-
-# Then add — gq remembers this env automatically
 gq add 'python train.py --seed 1'    # → runs inside myenv
 ```
 
@@ -450,19 +505,6 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 > Requires bash-completion (installed by default on most distros). The completion script lives at `completions/gq.bash` in the repo — usable after `git clone`.
 >
 > **For `gq add` filename completion, don't use quotes.** bash doesn't trigger completion inside single quotes, so `gq add 'python eval<Tab>'` won't complete. For simple commands, skip the quotes: `gq add python eval<Tab>` → `eval.py`. For commands with multiple arguments that need quotes, complete the filename first then wrap: `gq add train<Tab>` → edit to `gq add 'python train.py --seed 1'`.
-
-### TUI panel (optional)
-
-Typing bare `gq` (no subcommand) opens a full-screen TUI — htop/ranger-style: arrow keys to select an operation, Enter to run it, no command typing.
-
-- **Add job** → opens an embedded bash dialog to the right of the Add row (60% height, full available width); you can cd, tab-complete, test-run commands. Type the command to queue, press **F5** to submit (without executing), **Esc** to cancel, **Ctrl-C** to interrupt a test-run command. Then pick `--gpus`. Note: the embedded dialog doesn't support full-screen TUIs (ranger/vim/htop) — use CLI `gq add` for those.
-- **Stop: <id>** / **Cancel: #<n> <id>** → select, Enter, confirm.
-- **Clear queue** / **Quit** → Enter.
-- **Open log: <id>** → view that job's log tail.
-
-The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. The bottom hint is context-sensitive (changes based on which operation the cursor is on). `gq watch` still starts the daemon; task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
-
-> TUI Add requires the pyte library: `pip install pyte` (watch/CLI work without it)
 
 ### Tests
 
