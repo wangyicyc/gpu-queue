@@ -1532,7 +1532,7 @@ def _run_embedded_bash(stdscr, oy, ox):
             # 160-200ms after the keypress).
             got_output = False
             while True:
-                r, _, _ = select.select([master], [], [], 0.005)
+                r, _, _ = select.select([master], [], [], 0.02)
                 if not r:
                     break
                 try:
