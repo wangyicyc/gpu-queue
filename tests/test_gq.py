@@ -758,10 +758,15 @@ def test_cmd_add_without_gpus_default_single_and_notice(tmp_path, monkeypatch, c
 # ---------------------------------------------------------------------------
 
 def test_build_rows_empty():
-    """No running, no queued: only static ops (Add, Clear, Quit)."""
+    """No running, no queued: all ops visible with placeholders."""
     rows = gq._build_rows({"daemon_pid": None, "running": {}}, [])
     actions = [r["action"] for r in rows]
-    assert actions == ["add", "clear", "quit"]
+    # Add, Stop(placeholder), Open log(placeholder), Cancel(placeholder), Clear, Quit
+    assert actions == ["add", "stop", "open_log", "cancel", "clear", "quit"]
+    # Placeholders have job_id=None
+    stop_row = next(r for r in rows if r["action"] == "stop")
+    assert stop_row["job_id"] is None
+    assert "none running" in stop_row["label"]
 
 
 def test_build_rows_with_running_and_queued():

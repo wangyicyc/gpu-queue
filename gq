@@ -459,25 +459,37 @@ def _format_elapsed(seconds: float) -> str:
 def _build_rows(state: dict, queue: list) -> list:
     """Build the TUI operations list from current state + queue. Pure (no curses).
 
-    Row order: Add, then one Stop + one Open-log per running job, then one
-    Cancel per queued job, then Clear, Quit. Each row:
-      {"kind": "op"|"job", "label": str, "action": str, "job_id": str|None}
+    All operations are ALWAYS visible (Add, Stop, Cancel, Open log, Clear,
+    Quit). When there are running/queued jobs, Stop/Cancel/Open log show
+    per-job entries; when there are none, a single placeholder row is shown
+    that prints a "no jobs" message on activation.
+    Row: {"kind": "op"|"job", "label": str, "action": str, "job_id": str|None}
     """
     rows = []
     rows.append({"kind": "op", "label": "Add job",
                  "action": "add", "job_id": None})
     running = state.get("running") or {}
-    for rid, r in running.items():
-        cards = ",".join(str(c) for c in r.get("cards", []))
-        rows.append({"kind": "job", "label": f"Stop: {rid}  ({r.get('cmd','')} GPU {cards})",
-                     "action": "stop", "job_id": rid})
-    for rid, r in running.items():
-        rows.append({"kind": "job", "label": f"Open log: {rid}",
-                     "action": "open_log", "job_id": rid})
-    for i, job in enumerate(queue, 1):
-        rows.append({"kind": "job",
-                     "label": f"Cancel: #{i} {job['id']}  ({job.get('cmd','')})",
-                     "action": "cancel", "job_id": job["id"]})
+    if running:
+        for rid, r in running.items():
+            cards = ",".join(str(c) for c in r.get("cards", []))
+            rows.append({"kind": "job", "label": f"Stop: {rid}  ({r.get('cmd','')} GPU {cards})",
+                         "action": "stop", "job_id": rid})
+        for rid, r in running.items():
+            rows.append({"kind": "job", "label": f"Open log: {rid}",
+                         "action": "open_log", "job_id": rid})
+    else:
+        rows.append({"kind": "op", "label": "Stop running job  (none running)",
+                     "action": "stop", "job_id": None})
+        rows.append({"kind": "op", "label": "Open log  (none running)",
+                     "action": "open_log", "job_id": None})
+    if queue:
+        for i, job in enumerate(queue, 1):
+            rows.append({"kind": "job",
+                         "label": f"Cancel: #{i} {job['id']}  ({job.get('cmd','')})",
+                         "action": "cancel", "job_id": job["id"]})
+    else:
+        rows.append({"kind": "op", "label": "Cancel queued job  (queue empty)",
+                     "action": "cancel", "job_id": None})
     rows.append({"kind": "op", "label": "Clear queue",
                  "action": "clear", "job_id": None})
     rows.append({"kind": "op", "label": "Quit",
@@ -1046,10 +1058,16 @@ def _tui_do_action(stdscr, row, focus) -> bool:
             q.append(job)
         return False
     if action == "stop":
+        if not row.get("job_id"):
+            print("[gq] no running job to stop.", file=sys.stderr)
+            return False
         if _tui_confirm(stdscr, focus_y, label, f"Stop {row['job_id']}?"):
             cmd_stop(argparse.Namespace(job_id=row["job_id"]))
         return False
     if action == "cancel":
+        if not row.get("job_id"):
+            print("[gq] no queued job to cancel.", file=sys.stderr)
+            return False
         if _tui_confirm(stdscr, focus_y, label, f"Cancel {row['job_id']}?"):
             _dispatch_action(row)
         return False
@@ -1058,6 +1076,9 @@ def _tui_do_action(stdscr, row, focus) -> bool:
             _dispatch_action(row)
         return False
     if action == "open_log":
+        if not row.get("job_id"):
+            print("[gq] no running job to open log for.", file=sys.stderr)
+            return False
         log_path = LOG_DIR / f"{row['job_id']}.log"
         _tui_show_log(stdscr, log_path)
         return False
