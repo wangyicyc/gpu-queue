@@ -10,11 +10,11 @@
 
 ### 特点
 
-- **单文件、零依赖**：纯 Python 标准库，一个 `gq` 脚本，无需 `pip install`
-- **空闲检测按"你的进程"判断**：不是看 GPU 利用率数字，而是看 `nvidia-smi` 里有没有**当前用户**的进程在占 GPU。你的进程结束 = 空闲 = 拖下一个任务，比显存阈值更准
+- **TUI 可视化面板**：敲 `gq`（不带子命令）进入全屏 TUI，htop 式 GPU 占用条 + 方向键选择操作 + 上下文敏感底部提示。Add 对话框内嵌 bash（vim 式 exec/submit 模式切换，Ctrl-S 切换，颜色区分），支持 cd/tab 补全/试跑命令，F5 或 Enter 提交
 - **多卡并行**：多张卡上可同时跑多个任务，每个任务用 `--gpus N` 声明要几张卡，gq 自动挑空闲卡分配并注入 `CUDA_VISIBLE_DEVICES`
-- **安全**：fcntl 文件锁防并发写坏；Ctrl-C 一次优雅停、连按两次强制杀当前任务；daemon 崩溃重启能识别并清理孤儿进程
-- **自动带上你的环境**：`gq add` 时会快照当前 `conda`/`venv` 环境,daemon 执行时原样还原。`conda activate myenv` 后再 `gq add 'python train.py'`,任务就在 `myenv` 里跑
+- **自动带上你的环境**：`gq add` 时会快照当前 `conda`/`venv` 环境，daemon 执行时原样还原。`conda activate myenv` 后再 `gq add 'python train.py'`，任务就在 `myenv` 里跑
+- **空闲检测按"你的进程"判断**：不是看 GPU 利用率数字，而是看 `nvidia-smi` 里有没有**当前用户**的进程在占 GPU。你的进程结束 = 空闲 = 拖下一个任务，比显存阈值更准
+- **安全**：fcntl 文件锁防并发写坏；Ctrl-C 一次优雅停、连按两次强制杀当前任务；daemon 崩溃重启能识别并清理孤儿进程；killpg 三重条件守卫，绝不会误杀用户会话
 - **任意 shell 命令**：`python train.py`、`bash run.sh` 都能排队
 
 ### 安装
@@ -46,11 +46,10 @@ pip install pyte
 #### 快速开始
 
 ```bash
-# 1) 开 tmux，起常驻 daemon（所有任务输出都打到这里）
-tmux new -s gq
+# 1) 起常驻 daemon（所有任务摘要打到这里）
 gq watch --poll 15
 
-# 2) 另开一个 tmux 窗口（Ctrl-B c），加任务
+# 2) 另开一个终端窗口，加任务
 gq add 'python train.py --seed 1'
 gq add 'python train.py --seed 2'
 
@@ -126,7 +125,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 
 | 命令 | 作用 |
 |------|------|
-| `gq watch [--poll N]` | 启动 daemon（默认 15 秒轮询；在 tmux 里跑） |
+| `gq watch [--poll N]` | 启动 daemon（默认 15 秒轮询） |
 | `gq add [--gpus N] 'cmd'` | 追加任务（--gpus N 指定要几张卡，默认 1） |
 | `gq list` | 查看运行中的任务 + 待跑队列 + daemon 状态 |
 | `gq cancel <id>` | 按 ID 或唯一前缀移除排队中的任务 |
@@ -232,7 +231,7 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 - **Clear queue** / **Quit** → 回车执行。
 - **Open log: <id>** → 查看该任务的输出日志尾部。
 
-面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。底部提示根据光标所在命令动态变化（如选中 Add 时提示 F5/Esc/Ctrl-C，选中 Stop 时提示"停掉运行中任务"）。`gq watch` 仍是起 daemon 的命令（在 tmux 里常驻），任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
+面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。底部提示根据光标所在命令动态变化（如选中 Add 时提示 F5/Esc/Ctrl-C，选中 Stop 时提示"停掉运行中任务"）。`gq watch` 仍是起 daemon 的命令，任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
 
 > TUI 的 Add 功能依赖 pyte 库：`pip install pyte`（watch/命令行不需要）
 
@@ -263,11 +262,11 @@ A lightweight local GPU job queue: throw shell commands into a queue, and `gq` w
 
 ### Features
 
-- **Single file, zero dependencies** — pure Python stdlib, one `gq` script, no `pip install`
-- **Idle = "your process is gone"** — instead of GPU utilization thresholds, it checks `nvidia-smi` for any process owned by the **current user**. Your process ends → idle → next job runs. More accurate than memory thresholds.
+- **TUI visualization panel** — typing bare `gq` opens a full-screen TUI with htop-style GPU bars, arrow-key operation selection, and context-sensitive bottom hints. The Add dialog embeds a real bash (vim-style exec/submit mode switch via Ctrl-S, color-coded), supporting cd/tab-completion/test-run; F5 or Enter to submit
 - **Multi-GPU parallel** — multiple jobs run at once across cards; each job declares `--gpus N`, gq picks N idle cards and injects `CUDA_VISIBLE_DEVICES`
-- **Safe** — `fcntl` file locks prevent corruption; Ctrl-C once = graceful, twice = force-kill; crash recovery detects and reaps orphaned subprocesses
 - **Carries your environment** — `gq add` snapshots the current `conda`/`venv` env and the daemon restores it at execution time. `conda activate myenv` then `gq add 'python train.py'` runs the job inside `myenv`
+- **Idle = "your process is gone"** — instead of GPU utilization thresholds, it checks `nvidia-smi` for any process owned by the **current user**. Your process ends → idle → next job runs. More accurate than memory thresholds.
+- **Safe** — `fcntl` file locks prevent corruption; Ctrl-C once = graceful, twice = force-kill; crash recovery detects and reaps orphaned subprocesses; killpg three-way guard never kills the user's session
 - **Any shell command** — `python train.py`, `bash run.sh`, anything
 
 ### Install
@@ -295,11 +294,10 @@ pip install pyte
 #### Quick start
 
 ```bash
-# 1) Open tmux, start the daemon (all job output lands here)
-tmux new -s gq
+# 1) Start the daemon (all job summaries land here)
 gq watch --poll 15
 
-# 2) Open another tmux pane (Ctrl-B c), add jobs
+# 2) Open another terminal, add jobs
 gq add 'python train.py --seed 1'
 gq add 'python train.py --seed 2'
 
@@ -375,7 +373,7 @@ conda activate torch210 && gq add 'python train.py --seed 2'
 
 | Command | Description |
 |---------|-------------|
-| `gq watch [--poll N]` | Start the daemon (default poll 15s; run in tmux) |
+| `gq watch [--poll N]` | Start the daemon (default poll 15s) |
 | `gq add [--gpus N] 'cmd'` | Append a job (`--gpus N` sets how many cards, default 1) |
 | `gq list` | Show running job + pending queue + daemon status |
 | `gq cancel <id>` | Remove a pending job by ID or unique prefix |
@@ -462,7 +460,7 @@ Typing bare `gq` (no subcommand) opens a full-screen TUI — htop/ranger-style: 
 - **Clear queue** / **Quit** → Enter.
 - **Open log: <id>** → view that job's log tail.
 
-The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. The bottom hint is context-sensitive (changes based on which operation the cursor is on). `gq watch` still starts the daemon (in tmux); task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
+The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. The bottom hint is context-sensitive (changes based on which operation the cursor is on). `gq watch` still starts the daemon; task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
 
 > TUI Add requires the pyte library: `pip install pyte` (watch/CLI work without it)
 
