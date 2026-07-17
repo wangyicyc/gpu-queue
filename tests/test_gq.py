@@ -1435,7 +1435,7 @@ def test_key_to_bytes_arrow_and_ctrl():
     assert gq._key_to_bytes(_c.KEY_RIGHT) == b"\x1b[C"
     assert gq._key_to_bytes(_c.KEY_LEFT) == b"\x1b[D"
     assert gq._key_to_bytes(3) == b"\x03"              # Ctrl-C
-    assert gq._key_to_bytes(_c.KEY_ENTER) == b"\r"  # Enter executes in bash
+    assert gq._key_to_bytes(_c.KEY_ENTER) is None  # Enter reserved for submit (same as F5)
     assert gq._key_to_bytes(ord("a")) == b"a"
     assert gq._key_to_bytes(ord("\t")) == b"\t"
 
