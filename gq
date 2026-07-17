@@ -961,13 +961,22 @@ def _tui_blocking_mode(stdscr):
     clears the halfdelay timer; we then re-enable cbreak for raw key reads.
     Returns nothing — pair with _tui_restore_halfdelay(stdscr).
     """
-    curses.nocbreak()  # clears halfdelay; getch now blocks until a real key
-    curses.cbreak()    # re-enable raw mode (no line buffering) without timeout
+    try:
+        curses.nocbreak()  # clears halfdelay; getch now blocks until a real key
+    except curses.error:
+        pass
+    try:
+        curses.cbreak()    # re-enable raw mode (no line buffering) without timeout
+    except curses.error:
+        pass
 
 
 def _tui_restore_halfdelay(stdscr):
     """Restore the 2-second halfdelay tick after a modal returns."""
-    curses.halfdelay(20)
+    try:
+        curses.halfdelay(20)
+    except curses.error:
+        pass
 
 
 def _tui_confirm(stdscr, focus_y, label, msg):
