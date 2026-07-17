@@ -972,9 +972,9 @@ def _tui_blocking_mode(stdscr):
 
 
 def _tui_restore_halfdelay(stdscr):
-    """Restore the 2-second halfdelay tick after a modal returns."""
+    """Restore the 1-second halfdelay tick after a modal returns."""
     try:
-        curses.halfdelay(20)
+        curses.halfdelay(10)
     except curses.error:
         pass
 
@@ -1122,7 +1122,7 @@ def _tui_main(stdscr):
     """Curses TUI main loop. stdscr is provided by curses.wrapper."""
     curses.curs_set(0)  # hide cursor
     stdscr.keypad(True)
-    curses.halfdelay(20)  # 2-second refresh tick; keys return immediately
+    curses.halfdelay(10)  # 1-second refresh tick; keys return immediately
     focus = 0
     # Cache the expensive nvidia-smi reads (busy_cards / _gpu_utilization) and
     # only REFRESH them on the halfdelay timeout (every 2s), NOT on every
