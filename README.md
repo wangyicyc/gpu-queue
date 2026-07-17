@@ -227,12 +227,12 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 
 直接敲 `gq`（不带子命令）进入一个全屏 TUI 面板，像 htop/ranger 那样用上下方向键选择操作、回车执行，不用打命令名：
 
-- **Add job** → 在 Add 行右侧展开一个嵌入式 bash 对话框（60% 高，70% 宽），可以 cd、tab 补全、试跑命令；打好要排队的命令后按 **F5** 提交（不执行该命令），**Esc** 取消，**Ctrl-C** 中断正在试跑的命令。提交后选 `--gpus` 卡数入队。
+- **Add job** → 在 Add 行右侧展开一个嵌入式 bash 对话框（60% 高，尽量占满宽度），可以 cd、tab 补全、试跑命令；打好要排队的命令后按 **F5** 提交（不执行该命令），**Esc** 取消，**Ctrl-C** 中断正在试跑的命令。提交后选 `--gpus` 卡数入队。注意：嵌入式对话框不支持全屏 TUI 程序（ranger/vim/htop），需要这些请用命令行 `gq add`。
 - **Stop: <id>** / **Cancel: #<n> <id>** → 选中回车，确认后停/取消该任务。
 - **Clear queue** / **Quit** → 回车执行。
 - **Open log: <id>** → 查看该任务的输出日志尾部。
 
-面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。`gq watch` 仍是起 daemon 的命令（在 tmux 里常驻），任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
+面板顶部显示每张 GPU 的占用和谁在用，每 2 秒自动刷新（不闪），按键即时响应。底部提示根据光标所在命令动态变化（如选中 Add 时提示 F5/Esc/Ctrl-C，选中 Stop 时提示"停掉运行中任务"）。`gq watch` 仍是起 daemon 的命令（在 tmux 里常驻），任务输出写到 `~/.gpu-queue/logs/<id>.log`（watch 终端只打印摘要）。退出 TUI（Quit）不影响正在跑的任务。
 
 > TUI 的 Add 功能依赖 pyte 库：`pip install pyte`（watch/命令行不需要）
 
@@ -244,7 +244,7 @@ cd gpu-queue
 python -m pytest tests/ -v
 ```
 
-87 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复、多卡调度、TUI 逻辑。
+96 个测试，覆盖 GPU 检测、文件锁、并发安全、命令、daemon 循环、信号处理、崩溃恢复、多卡调度、TUI 逻辑、killpg 安全。
 
 ### 限制
 
@@ -457,19 +457,19 @@ cp completions/gq.bash ~/.local/share/bash-completion/completions/gq
 
 Typing bare `gq` (no subcommand) opens a full-screen TUI — htop/ranger-style: arrow keys to select an operation, Enter to run it, no command typing.
 
-- **Add job** → opens an embedded bash dialog to the right of the Add row (60% height, 70% width); you can cd, tab-complete, test-run commands. Type the command to queue, press **F5** to submit (without executing), **Esc** to cancel, **Ctrl-C** to interrupt a test-run command. Then pick `--gpus`.
+- **Add job** → opens an embedded bash dialog to the right of the Add row (60% height, full available width); you can cd, tab-complete, test-run commands. Type the command to queue, press **F5** to submit (without executing), **Esc** to cancel, **Ctrl-C** to interrupt a test-run command. Then pick `--gpus`. Note: the embedded dialog doesn't support full-screen TUIs (ranger/vim/htop) — use CLI `gq add` for those.
 - **Stop: <id>** / **Cancel: #<n> <id>** → select, Enter, confirm.
 - **Clear queue** / **Quit** → Enter.
 - **Open log: <id>** → view that job's log tail.
 
-The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. `gq watch` still starts the daemon (in tmux); task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
+The top bar shows each GPU's utilization and owner, auto-refreshing every 2s (no flicker), keys respond instantly. The bottom hint is context-sensitive (changes based on which operation the cursor is on). `gq watch` still starts the daemon (in tmux); task output goes to `~/.gpu-queue/logs/<id>.log` (the watch terminal prints only summaries). Quitting the TUI does not affect running jobs.
 
 > TUI Add requires the pyte library: `pip install pyte` (watch/CLI work without it)
 
 ### Tests
 
 ```bash
-python -m pytest tests/ -v    # 87 tests
+python -m pytest tests/ -v    # 96 tests
 ```
 
 ### Limitations
