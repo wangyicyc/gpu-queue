@@ -1473,6 +1473,20 @@ def _run_embedded_bash(stdscr, oy, ox):
         # "submit" (Enter submits the command line to the gq queue, like F5).
         # Toggle with Ctrl-S. Like vim's insert/normal mode switch.
         mode = "exec"
+        # Drain bash's initial output (the rcfile echoes a compose hint +
+        # bash prompt) before entering the loop — without this the dialog
+        # is blank until the first keypress.
+        time.sleep(0.05)  # give bash 50ms to write its initial output
+        while True:
+            r, _, _ = select.select([master], [], [], 0)
+            if not r:
+                break
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                break
+            if data:
+                stream.feed(data.decode("utf-8", "replace"))
         while True:
             # 1. Read bash output, feed pyte. Use a small select timeout (5ms)
             # instead of 0 so bash has time to echo the key we just forwarded —
@@ -1577,12 +1591,17 @@ def _run_embedded_bash(stdscr, oy, ox):
             stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
+            # Ctrl-S (19) toggles mode (exec ↔ submit) — MUST be handled
+            # BEFORE the key-forwarding block below, otherwise _key_to_bytes(19)
+            # returns b'\x13' and it gets forwarded to bash instead of toggling.
+            if ch == 19:
+                mode = "submit" if mode == "exec" else "exec"
+                dirty = True
+                continue  # redraw with new mode color + hint
             # After forwarding a key to bash, drain its output and redraw
             # immediately (don't wait for the next halfdelay cycle). Without
             # this, Tab completion / command output doesn't appear until the
-            # user presses another key — because the forwarded key sets ch=-1
-            # (arrow seq) or ch=3 (Ctrl-C) which doesn't set dirty=True, so
-            # the next cycle's render is skipped.
+            # user presses another key.
             kb = _key_to_bytes(ch) if ch != -1 else None
             if kb is not None:
                 try:
@@ -1612,10 +1631,6 @@ def _run_embedded_bash(stdscr, oy, ox):
                     # draining (e.g. multi-line Tab completion listings).
                     deadline = time.monotonic() + 0.2
                 continue  # redraw now, don't fall through to Enter/F5 handling
-            # Ctrl-S (19) toggles mode (exec ↔ submit), like vim's mode switch.
-            if ch == 19:
-                mode = "submit" if mode == "exec" else "exec"
-                continue  # redraw with new mode color + hint
             # F5 always submits (regardless of mode).
             # Enter submits in "submit" mode, executes in "exec" mode.
             is_submit = (ch == _c.KEY_F5
