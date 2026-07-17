@@ -1041,14 +1041,14 @@ def _tui_do_action(stdscr, row, focus) -> bool:
     focus_y = 1 + _total_cards() + 1 + focus * 2
     label = row.get("label", "")
     if action == "add":
-        # Full-screen bash: spawn bash with the F5-capture rcfile, let it
-        # take over the terminal (so ranger/vim/htop work), F5 submits the
-        # current command line, Ctrl-D cancels. The embedded dialog
-        # (_run_embedded_bash) can't run full-screen TUIs (pyte is a partial
-        # terminal emulator), so we use the full-screen approach instead.
-        captured = _run_fullscreen_bash()
+        # Embedded bash dialog: bash runs in a pty, rendered via pyte inside
+        # a curses dialog. F5 submits, Esc cancels. Full-screen TUIs (ranger/
+        # vim) won't work (pyte is a partial terminal emulator), but the
+        # embedded experience (inline dialog, green prompt, cursor) is better
+        # than full-screen bash taking over the terminal.
+        captured = _run_embedded_bash(stdscr, oy=focus_y, ox=4)
         if not captured:
-            return False  # user cancelled (Ctrl-D)
+            return False  # user cancelled in bash
         n = _tui_select_gpus(stdscr)
         job = _make_job(captured["cmd"], captured["cwd"], n=n)
         # Strip READLINE_LINE/READLINE_POINT (set by bash's bind -x during
