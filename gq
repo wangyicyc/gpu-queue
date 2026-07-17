@@ -1671,12 +1671,46 @@ def _run_embedded_bash(stdscr, oy, ox):
             _skip_forward = (mode == "submit" and _is_enter)
             kb = _key_to_bytes(ch) if (ch != -1 and not _skip_forward) else None
             if kb is not None:
-                try:
-                    os.write(master, kb)
-                except OSError:
-                    pass
+                # PASTE DETECTION: if the next byte is already available
+                # (nodelay peek returns non-(-1)), we're in a paste burst —
+                # batch-read ALL available bytes, forward them to bash in one
+                # write, and only drain+redraw ONCE at the end. This avoids
+                # per-character drain+redraw during paste (which is extremely
+                # slow over SSH — each char = 1 network round-trip + 1 render).
+                stdscr.nodelay(True)
+                _paste_buf = bytearray(kb)
+                while True:
+                    _pch = stdscr.getch()
+                    if _pch == -1:
+                        break
+                    # Stop paste on reserved keys (Esc, Ctrl-S, F5).
+                    if _pch in (27, 19, _c.KEY_F5, _c.KEY_ENTER, 10, 13):
+                        # Put it back by handling it next cycle — for now just
+                        # break and let the outer loop re-read it.
+                        # We can't "unget" in curses easily, so we handle it
+                        # inline if it's a reserved key.
+                        if _pch == 19:
+                            mode = "submit" if mode == "exec" else "exec"
+                        elif _pch == 27:
+                            break  # Esc — stop paste, let outer loop handle
+                        elif _pch in (_c.KEY_F5, _c.KEY_ENTER, 10, 13) and mode == "submit":
+                            # Submit during paste — forward what we have, then submit
+                            break
+                        else:
+                            _paste_buf.extend(_key_to_bytes(_pch) or b"")
+                        continue
+                    _pkb = _key_to_bytes(_pch)
+                    if _pkb is not None:
+                        _paste_buf.extend(_pkb)
+                stdscr.nodelay(False)
+                # Forward the entire paste buffer to bash in one write.
+                if _paste_buf:
+                    try:
+                        os.write(master, bytes(_paste_buf))
+                    except OSError:
+                        pass
+                # Drain bash output ONCE (not per-character) and redraw.
                 # Drain bash output (bash echoes the key + any completion/
-                # command output) with a short wait, then force a redraw.
                 # Use a longer timeout (200ms) because Tab completion of long
                 # filenames can take >50ms (filesystem scan). Keep polling as
                 # long as bash keeps producing output; only break when bash
