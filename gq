@@ -1639,7 +1639,13 @@ def _run_embedded_bash(stdscr, oy, ox):
             # immediately (don't wait for the next halfdelay cycle). Without
             # this, Tab completion / command output doesn't appear until the
             # user presses another key.
-            kb = _key_to_bytes(ch) if ch != -1 else None
+            # BUT: in submit mode, Enter must NOT be forwarded (it submits,
+            # not executes) — skip forwarding for Enter in submit mode so it
+            # falls through to the is_submit check below. F5 is already
+            # reserved in _key_to_bytes (returns None) so it's not forwarded.
+            _is_enter = (ch == _c.KEY_ENTER or ch == 10 or ch == 13)
+            _skip_forward = (mode == "submit" and _is_enter)
+            kb = _key_to_bytes(ch) if (ch != -1 and not _skip_forward) else None
             if kb is not None:
                 try:
                     os.write(master, kb)
