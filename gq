@@ -982,6 +982,22 @@ def _tui_restore_halfdelay(stdscr):
         pass
 
 
+def _tui_show_msg(stdscr, msg):
+    """Show a transient message at the bottom of the screen; any key returns.
+    Used for 'no running job' etc. — must NOT use print() which corrupts
+    the curses screen."""
+    h, w = stdscr.getmaxyx()
+    _safe_addstr(stdscr, h - 1, 4, f" {msg} (any key) "[:w - 1 - 4],
+                 curses.color_pair(2) | curses.A_BOLD)
+    stdscr.noutrefresh()
+    curses.doupdate()
+    _tui_blocking_mode(stdscr)
+    try:
+        stdscr.getch()
+    finally:
+        _tui_restore_halfdelay(stdscr)
+
+
 def _tui_confirm(stdscr, focus_y, label, msg):
     """y/n confirm drawn INLINE on the focused row, right after its label —
     so the prompt sits next to the operation the user selected, not stranded
@@ -1073,14 +1089,14 @@ def _tui_do_action(stdscr, row, focus) -> bool:
         return False
     if action == "stop":
         if not row.get("job_id"):
-            print("[gq] no running job to stop.", file=sys.stderr)
+            _tui_show_msg(stdscr, "No running job to stop.")
             return False
         if _tui_confirm(stdscr, focus_y, label, f"Stop {row['job_id']}?"):
             cmd_stop(argparse.Namespace(job_id=row["job_id"]))
         return False
     if action == "cancel":
         if not row.get("job_id"):
-            print("[gq] no queued job to cancel.", file=sys.stderr)
+            _tui_show_msg(stdscr, "No queued job to cancel.")
             return False
         if _tui_confirm(stdscr, focus_y, label, f"Cancel {row['job_id']}?"):
             _dispatch_action(row)
@@ -1091,7 +1107,7 @@ def _tui_do_action(stdscr, row, focus) -> bool:
         return False
     if action == "open_log":
         if not row.get("job_id"):
-            print("[gq] no running job to open log for.", file=sys.stderr)
+            _tui_show_msg(stdscr, "No running job to open log for.")
             return False
         log_path = LOG_DIR / f"{row['job_id']}.log"
         _tui_show_log(stdscr, log_path)
