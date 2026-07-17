@@ -863,13 +863,21 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
         for c in r.get("cards", []):
             card_to_job[c] = (rid, r)
 
+    # Per-GPU utilization bars — laid out in a grid (up to 4 per row) so 8
+    # GPUs fit in 2 rows instead of 8. Each cell is ~22 chars wide:
+    # "GPU 0  ████░░░  42% " — fits 4 per row on an 80-col terminal.
     y = 1
+    GPUs_PER_ROW = 4
+    CELL_W = (w - 1 - 2 * PAD) // GPUs_PER_ROW
     for gpu in range(total):
-        if y >= h - 1:
+        row_idx = gpu // GPUs_PER_ROW
+        col_idx = gpu % GPUs_PER_ROW
+        cell_y = y + row_idx
+        cell_x = PAD + col_idx * CELL_W
+        if cell_y >= h - 1:
             break
         pct = utils.get(gpu)
         if pct is None:
-            # nvidia-smi util unavailable: degrade to binary busy/free.
             pct = 100 if gpu in busy else 0
         if pct < 50:
             color = GREEN
@@ -877,29 +885,24 @@ def _render_panel(stdscr, rows, focus, gpu_summary, total, utils, busy, state):
             color = YELLOW
         else:
             color = RED
-        bar = _util_bar(pct, 12)
-        head = f"GPU {gpu:<2d} "
-        # Owning job id + cmd snippet + elapsed, if a running job holds this card.
+        bar = _util_bar(pct, 8)
+        head = f"G{gpu} "
+        # Owning job id (short) if a running job holds this card.
         job_info = ""
         owner = card_to_job.get(gpu)
         if owner is not None:
             rid, r = owner
-            cmd = r.get("cmd") or ""
-            snippet = cmd if len(cmd) <= 18 else cmd[:17] + "…"
-            try:
-                started = datetime.datetime.fromisoformat(r["started_at"])
-                elapsed = _format_elapsed(
-                    (datetime.datetime.now() - started).total_seconds())
-            except (KeyError, ValueError, TypeError):
-                elapsed = "--:--:--"
-            job_info = f"  {rid} {snippet}  {elapsed}"
+            job_info = f" {rid}"
         elif gpu in busy:
-            job_info = "  (busy)"
-        _safe_addstr(stdscr, y, PAD, head, curses.A_NORMAL)
-        _safe_addstr(stdscr, y, PAD + len(head), bar, curses.color_pair(color))
+            job_info = " busy"
+        _safe_addstr(stdscr, cell_y, cell_x, head, curses.A_NORMAL)
+        _safe_addstr(stdscr, cell_y, cell_x + len(head), bar,
+                     curses.color_pair(color))
         rest = f" {pct:>3d}%{job_info}"
-        _safe_addstr(stdscr, y, PAD + len(head) + len(bar), rest)
-        y += 1
+        _safe_addstr(stdscr, cell_y, cell_x + len(head) + len(bar), rest)
+    # Advance y past the GPU grid.
+    gpu_rows = (total + GPUs_PER_ROW - 1) // GPUs_PER_ROW
+    y = 1 + gpu_rows
 
     # Separator between GPU bars and operations list
     if y < h - 1:
