@@ -1171,7 +1171,7 @@ def _key_to_bytes(ch: int):
     — it executes the command in bash (for cd/source/test-run), and F5 submits
     the current command line to the gq queue without executing."""
     import curses as _c
-    reserved = {_c.KEY_F5, 27, _c.KEY_ENTER, 10, 13}  # F5, Enter, Esc — gq handles these
+    reserved = {_c.KEY_F5, 27}  # F5, Esc — gq handles these. Enter is mode-dependent.
     if ch in reserved:
         return None
     arrow = {_c.KEY_UP: b"\x1b[A", _c.KEY_DOWN: b"\x1b[B",
@@ -1179,7 +1179,7 @@ def _key_to_bytes(ch: int):
     if ch in arrow:
         return arrow[ch]
     if ch == _c.KEY_ENTER or ch == 10 or ch == 13:
-        return None  # Enter reserved for submit (same as F5)
+        return b"\r"  # Enter forwarded to bash (mode-dependent handling in caller)
     if ch == _c.KEY_BACKSPACE or ch == 127 or ch == 8:
         return b"\x7f"
     if 0 <= ch < 256:
@@ -1457,6 +1457,10 @@ def _run_embedded_bash(stdscr, oy, ox):
         # (784+ cells for a 14×56 dialog) runs every 0.2s even if the screen
         # is idle, blocking getch and making typing feel laggy.
         dirty = True  # draw once on entry
+        # Mode: "exec" (Enter executes in bash: cd/source/test-run) or
+        # "submit" (Enter submits the command line to the gq queue, like F5).
+        # Toggle with Ctrl-S. Like vim's insert/normal mode switch.
+        mode = "exec"
         while True:
             # 1. Read bash output, feed pyte. Use a small select timeout (5ms)
             # instead of 0 so bash has time to echo the key we just forwarded —
@@ -1481,17 +1485,26 @@ def _run_embedded_bash(stdscr, oy, ox):
                 try:
                     win.erase()
                     win.box()
-                    win.addstr(0, 2, " compose (F5 submit, Esc cancel) ",
-                               _c.A_BOLD)
+                    # Title bar shows current mode with color: green=exec,
+                    # yellow=submit. This makes the mode visually obvious.
+                    if mode == "exec":
+                        title = " EXEC mode (Enter: run  |  Ctrl-S: switch to submit) "
+                        title_attr = _c.color_pair(1) | _c.A_BOLD  # green
+                    else:
+                        title = " SUBMIT mode (Enter: submit  |  Ctrl-S: switch to exec) "
+                        title_attr = _c.color_pair(2) | _c.A_BOLD  # yellow
+                    win.addstr(0, 2, title[:dw - 4], title_attr)
                     _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2)
                     win.noutrefresh()
                 except _c.error:
                     pass
                 # Bottom hint on stdscr (outside the dialog subwindow).
                 try:
-                    stdscr.addstr(h - 1, 0,
-                                  " F5 submit  Esc cancel  Ctrl-C interrupt  |  Tab: complete  Ctrl-R: search history  ↑↓: history "[:w - 1],
-                                  _c.color_pair(4))
+                    if mode == "exec":
+                        hint = " ENTER: execute  Ctrl-S: submit mode  Esc: cancel  |  Tab: complete  Ctrl-R: search  ↑↓: history "
+                    else:
+                        hint = " ENTER: submit to queue  Ctrl-S: exec mode  Esc: cancel  |  Tab: complete  Ctrl-R: search  ↑↓: history "
+                    stdscr.addstr(h - 1, 0, hint[:w - 1], _c.color_pair(4))
                 except _c.error:
                     pass
                 stdscr.noutrefresh()
@@ -1543,7 +1556,16 @@ def _run_embedded_bash(stdscr, oy, ox):
             stdscr.keypad(True)  # restore for main panel
             if ch != -1:
                 dirty = True  # a key was pressed → redraw next cycle
-            if ch == _c.KEY_F5 or ch == _c.KEY_ENTER or ch == 10 or ch == 13:
+            # Ctrl-S (19) toggles mode (exec ↔ submit), like vim's mode switch.
+            if ch == 19:
+                mode = "submit" if mode == "exec" else "exec"
+                continue  # redraw with new mode color + hint
+            # F5 always submits (regardless of mode).
+            # Enter submits in "submit" mode, executes in "exec" mode.
+            is_submit = (ch == _c.KEY_F5
+                         or ((ch == _c.KEY_ENTER or ch == 10 or ch == 13)
+                             and mode == "submit"))
+            if is_submit:
                 # Forward F5 (\e[15~) to bash so the rcfile's `bind -x`
                 # fires __gq_capture, which writes the temp files (cmd, then
                 # cwd, then env) and exits bash. F5 is reserved in
