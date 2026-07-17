@@ -1411,26 +1411,29 @@ def _run_embedded_bash(stdscr, oy, ox):
             _c.halfdelay(1)  # 0.1s timeout — reads bash output promptly
             ch = stdscr.getch()
             if ch == 27:
-                # Possible Esc OR start of an escape sequence (arrow keys etc).
-                # Peek at the next byte with a tiny timeout to disambiguate.
+                # Possible Esc OR start of an escape sequence (arrow keys,
+                # F5=\e[15~, etc.). Peek at the next bytes to disambiguate.
                 stdscr.nodelay(True)
                 time.sleep(0.01)  # 10ms — enough for the rest of the seq
                 ch2 = stdscr.getch()
                 if ch2 != -1:
-                    # It's an escape sequence, not Esc. Forward \x1b + ch2
-                    # (+ any more bytes) to bash so readline handles arrows.
+                    # It's an escape sequence, not Esc. Collect all bytes.
                     seq = b"\x1b" + bytes([ch2])
-                    # Read any remaining bytes of the sequence (e.g. [A = 3 bytes)
                     while True:
                         ch3 = stdscr.getch()
                         if ch3 == -1:
                             break
                         seq += bytes([ch3])
-                    try:
-                        os.write(master, seq)
-                    except OSError:
-                        pass
-                    ch = -1  # not a real key for gq; just redraw
+                    # Check if it's F5 (\e[15~) — if so, treat as submit.
+                    if seq == b"\x1b[15~":
+                        ch = _c.KEY_F5  # pretend keypad interpreted it
+                    else:
+                        # Arrow key or other seq — forward to bash/readline.
+                        try:
+                            os.write(master, seq)
+                        except OSError:
+                            pass
+                        ch = -1  # not a real key for gq; just redraw
                 # else: real Esc, ch stays 27 → falls through to the Esc break
                 stdscr.nodelay(False)
             stdscr.keypad(True)  # restore for main panel
