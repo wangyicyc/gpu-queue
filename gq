@@ -1368,12 +1368,18 @@ def _run_embedded_bash(stdscr, oy, ox):
     with open(rc_path, "w") as f:
         f.write(_build_capture_rcfile(cmd_path, cwd_path, env_path))
 
-    screen = pyte.Screen(dw, dh)
+    # pyte screen + pty window size must account for the 1-cell border on
+    # each side (win.box()), so the usable area is (dw-2) x (dh-2). If we
+    # tell bash the terminal is dw wide, it outputs dw cols, but the last 2
+    # are hidden behind the border → truncation.
+    inner_w = dw - 2
+    inner_h = dh - 2
+    screen = pyte.Screen(inner_w, inner_h)
     stream = pyte.Stream(screen)
 
     master, slave = pty.openpty()
-    # Set the pty window size so bash/readline know the dialog dimensions.
-    winsize = struct.pack("HHHH", dh, dw, 0, 0)
+    # Set the pty window size to the INNER dimensions (what bash actually sees).
+    winsize = struct.pack("HHHH", inner_h, inner_w, 0, 0)
     try:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
     except OSError:
