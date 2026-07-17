@@ -1591,11 +1591,15 @@ def _run_embedded_bash(stdscr, oy, ox):
                     pass
                 # Drain bash output (bash echoes the key + any completion/
                 # command output) with a short wait, then force a redraw.
-                deadline = time.monotonic() + 0.05  # 50ms max wait
+                # Use a longer timeout (200ms) because Tab completion of long
+                # filenames can take >50ms (filesystem scan). Keep polling as
+                # long as bash keeps producing output; only break when bash
+                # goes quiet for 15ms.
+                deadline = time.monotonic() + 0.2  # 200ms max wait
                 while time.monotonic() < deadline:
-                    r, _, _ = select.select([master], [], [], 0.005)
+                    r, _, _ = select.select([master], [], [], 0.015)  # 15ms poll
                     if not r:
-                        break
+                        break  # bash went quiet — output complete
                     try:
                         data = os.read(master, 4096)
                     except OSError:
@@ -1604,6 +1608,9 @@ def _run_embedded_bash(stdscr, oy, ox):
                         break
                     stream.feed(data.decode("utf-8", "replace"))
                     dirty = True  # force redraw with new bash output
+                    # Reset deadline — bash is still producing output, keep
+                    # draining (e.g. multi-line Tab completion listings).
+                    deadline = time.monotonic() + 0.2
                 continue  # redraw now, don't fall through to Enter/F5 handling
             # Ctrl-S (19) toggles mode (exec ↔ submit), like vim's mode switch.
             if ch == 19:
