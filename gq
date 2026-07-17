@@ -1474,19 +1474,56 @@ def _run_embedded_bash(stdscr, oy, ox):
         # Toggle with Ctrl-S. Like vim's insert/normal mode switch.
         mode = "exec"
         # Drain bash's initial output (the rcfile echoes a compose hint +
-        # bash prompt) before entering the loop — without this the dialog
-        # is blank until the first keypress.
-        time.sleep(0.05)  # give bash 50ms to write its initial output
-        while True:
-            r, _, _ = select.select([master], [], [], 0)
-            if not r:
-                break
-            try:
-                data = os.read(master, 4096)
-            except OSError:
-                break
-            if data:
-                stream.feed(data.decode("utf-8", "replace"))
+        # bash prompt). bash may take a while to start (source ~/.bashrc,
+        # conda init, etc.) so retry with increasing waits.
+        for _wait in (0.05, 0.1, 0.2, 0.3, 0.5):
+            time.sleep(_wait)
+            _got_any = False
+            while True:
+                r, _, _ = select.select([master], [], [], 0.01)
+                if not r:
+                    break
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if data:
+                    stream.feed(data.decode("utf-8", "replace"))
+                    _got_any = True
+            if _got_any:
+                break  # bash produced output — prompt is ready
+        # Force an initial render so the dialog isn't blank.
+        try:
+            win.erase()
+            win.box()
+            if mode == "exec":
+                title = " EXEC mode (Enter: run  |  Ctrl-S: switch to submit) "
+                title_attr = _c.color_pair(1) | _c.A_BOLD
+            else:
+                title = " SUBMIT mode (Enter: submit  |  Ctrl-S: switch to exec) "
+                title_attr = _c.color_pair(2) | _c.A_BOLD
+            win.addstr(0, 2, title[:dw - 4], title_attr)
+            _render_pyte_to_dialog(win, screen, 1, 1, dh - 2, dw - 2, mode)
+            win.noutrefresh()
+        except _c.error:
+            pass
+        try:
+            if mode == "exec":
+                hint = " ENTER: execute  Ctrl-S: submit mode  Esc: cancel  |  Tab: complete  Ctrl-R: search  ↑↓: history "
+            else:
+                hint = " ENTER: submit to queue  Ctrl-S: exec mode  Esc: cancel  |  Tab: complete  Ctrl-R: search  ↑↓: history "
+            stdscr.addstr(h - 1, 0, hint[:w - 1], _c.color_pair(4))
+        except _c.error:
+            pass
+        stdscr.noutrefresh()
+        try:
+            cx = min(getattr(screen.cursor, "x", 0), dw - 2)
+            cy = min(getattr(screen.cursor, "y", 0), dh - 2)
+            stdscr.move(oy + 1 + cy, ox + 1 + cx)
+        except _c.error:
+            pass
+        _c.doupdate()
+        dirty = False  # already rendered; next render only on change
         while True:
             # 1. Read bash output, feed pyte. Use a small select timeout (5ms)
             # instead of 0 so bash has time to echo the key we just forwarded —
