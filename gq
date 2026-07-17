@@ -1041,16 +1041,18 @@ def _tui_do_action(stdscr, row, focus) -> bool:
     focus_y = 1 + _total_cards() + 1 + focus * 2
     label = row.get("label", "")
     if action == "add":
-        # Dialog origin: the Add row's screen y, x after label + padding.
-        captured = _run_embedded_bash(stdscr, oy=focus_y, ox=4)
+        # Full-screen bash: spawn bash with the F5-capture rcfile, let it
+        # take over the terminal (so ranger/vim/htop work), F5 submits the
+        # current command line, Ctrl-D cancels. The embedded dialog
+        # (_run_embedded_bash) can't run full-screen TUIs (pyte is a partial
+        # terminal emulator), so we use the full-screen approach instead.
+        captured = _run_fullscreen_bash()
         if not captured:
-            return False  # user cancelled in bash
+            return False  # user cancelled (Ctrl-D)
         n = _tui_select_gpus(stdscr)
         job = _make_job(captured["cmd"], captured["cwd"], n=n)
-        # Use the bash-captured env instead of the snapshot (bash may have
-        # activated a conda env during composition). Strip READLINE_LINE /
-        # READLINE_POINT first — these are set transiently by bash's `bind -x`
-        # during F5 capture and must not leak into the job's stored environment.
+        # Strip READLINE_LINE/READLINE_POINT (set by bash's bind -x during
+        # F5 capture, must not leak into the job's stored environment).
         env = {k: v for k, v in captured["env"].items()
                if k not in ("READLINE_LINE", "READLINE_POINT")}
         job["env"] = env
@@ -1261,6 +1263,72 @@ def _build_capture_rcfile(cmd_path: str, cwd_path: str, env_path: str) -> str:
         'bind -x \'"\\e[15~": "__gq_capture"\'\n'
         'echo "[gq] compose your command, then press F5 to submit (Esc to cancel)."\n'
     )
+
+
+def _run_fullscreen_bash():
+    """Spawn a full-screen interactive bash for composing a command. F5
+    captures the current readline line (via __gq_capture rcfile bind) and
+    exits; Ctrl-D cancels. Returns {"cmd","cwd","env"} on F5, None on cancel.
+
+    Unlike _run_embedded_bash (which renders bash inside a curses dialog via
+    pyte and can't run full-screen TUIs like ranger/vim), this lets bash take
+    over the terminal directly — ranger/vim/htop all work. curses is
+    suspended (endwin) while bash runs, then restored by the caller's
+    doupdate on the next render cycle.
+    """
+    import tempfile, os, subprocess, signal
+    cmd_fd, cmd_path = tempfile.mkstemp(prefix="gq_cmd_")
+    cwd_fd, cwd_path = tempfile.mkstemp(prefix="gq_cwd_")
+    env_fd, env_path = tempfile.mkstemp(prefix="gq_env_")
+    rc_fd, rc_path = tempfile.mkstemp(prefix="gq_rc_")
+    for fd in (cmd_fd, cwd_fd, env_fd, rc_fd):
+        os.close(fd)
+    with open(rc_path, "w") as f:
+        f.write(_build_capture_rcfile(cmd_path, cwd_path, env_path))
+
+    # Suspend curses so bash gets a clean terminal.
+    curses.endwin()
+    try:
+        proc = subprocess.Popen(["bash", "--rcfile", rc_path, "-i"],
+                                stdin=sys.stdin, stdout=sys.stdout,
+                                stderr=sys.stderr,
+                                preexec_fn=os.setsid)
+        proc.wait()
+    finally:
+        # Restore curses (the caller's next render cycle will doupdate).
+        curses.doupdate()
+
+    # Read captured files.
+    try:
+        cmd = Path(cmd_path).read_text()
+    except OSError:
+        cmd = ""
+    result = None
+    if cmd:
+        try:
+            cwd = Path(cwd_path).read_text().strip()
+        except OSError:
+            cwd = os.getcwd()
+        env = {}
+        try:
+            raw = Path(env_path).read_bytes()
+            for entry in raw.split(b"\x00"):
+                if b"=" in entry:
+                    k, _, v = entry.partition(b"=")
+                    try:
+                        env[k.decode()] = v.decode()
+                    except UnicodeDecodeError:
+                        continue
+        except OSError:
+            pass
+        result = {"cmd": cmd, "cwd": cwd, "env": env}
+
+    for p in (cmd_path, cwd_path, env_path, rc_path):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    return result
 
 
 def _run_embedded_bash(stdscr, oy, ox):
