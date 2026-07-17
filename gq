@@ -1538,6 +1538,15 @@ def _run_embedded_bash(stdscr, oy, ox):
             # there's nothing following, it's a real Esc → cancel.
             stdscr.keypad(False)
             _c.halfdelay(1)  # 0.1s timeout — reads bash output promptly
+            # halfdelay() re-enters cbreak mode which restores ISIG, so
+            # Ctrl-C would be intercepted by the tty (as SIGINT) instead of
+            # reaching getch as \x03. Re-apply raw() AFTER halfdelay to clear
+            # ISIG again, so Ctrl-C reaches getch and we can forward \x03 to
+            # bash to interrupt a running test command.
+            try:
+                _c.raw()
+            except _c.error:
+                pass
             ch = stdscr.getch()
             if ch == 27:
                 # Possible Esc OR start of an escape sequence (arrow keys,
