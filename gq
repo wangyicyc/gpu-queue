@@ -982,6 +982,24 @@ def _tui_restore_halfdelay(stdscr):
         pass
 
 
+def _tui_force_refresh(stdscr):
+    """Force an immediate screen redraw after a state-changing action (stop,
+    cancel, clear). Without this, the TUI waits up to 1s (halfdelay) before
+    re-reading state and redrawing — making the user think the action didn't
+    work, so they press Stop again (2-3 times)."""
+    state = read_state()
+    queue = read_queue()
+    cached_total = _total_cards()
+    cached_busy = busy_cards()
+    cached_utils = _gpu_utilization()
+    rows = _build_rows(state, queue)
+    nrun = len(state.get("running") or {})
+    summary = _gpu_summary_line(cached_total, cached_busy, nrun, len(queue))
+    _render_panel(stdscr, rows, 0, summary, cached_total, cached_utils,
+                  cached_busy, state)
+    curses.doupdate()
+
+
 def _tui_show_msg(stdscr, msg):
     """Show a transient message at the bottom of the screen; any key returns.
     Used for 'no running job' etc. — must NOT use print() which corrupts
@@ -1093,6 +1111,9 @@ def _tui_do_action(stdscr, row, focus) -> bool:
             return False
         if _tui_confirm(stdscr, focus_y, label, f"Stop {row['job_id']}?"):
             cmd_stop(argparse.Namespace(job_id=row["job_id"]))
+            # Force immediate refresh — don't wait for the next halfdelay
+            # cycle (up to 1s) for the TUI to show the job is gone.
+            _tui_force_refresh(stdscr)
         return False
     if action == "cancel":
         if not row.get("job_id"):
@@ -1100,10 +1121,12 @@ def _tui_do_action(stdscr, row, focus) -> bool:
             return False
         if _tui_confirm(stdscr, focus_y, label, f"Cancel {row['job_id']}?"):
             _dispatch_action(row)
+            _tui_force_refresh(stdscr)
         return False
     if action == "clear":
         if _tui_confirm(stdscr, focus_y, label, "Clear all queued jobs?"):
             _dispatch_action(row)
+            _tui_force_refresh(stdscr)
         return False
     if action == "open_log":
         if not row.get("job_id"):
